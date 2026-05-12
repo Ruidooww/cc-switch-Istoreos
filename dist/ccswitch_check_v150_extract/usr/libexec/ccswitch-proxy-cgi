@@ -1,0 +1,490 @@
+#!/bin/sh
+
+CONFIG="ccswitch"
+LOG_FILE="/etc/ccswitch/usage.jsonl"
+DEFAULT_TIMEOUT="600"
+DEFAULT_RETAIN="2000"
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_bool() {
+	[ "$1" = "1" ] && printf 'true' || printf 'false'
+}
+
+header_status_text() {
+	case "$1" in
+		200) printf '200 OK' ;;
+		400) printf '400 Bad Request' ;;
+		401) printf '401 Unauthorized' ;;
+		403) printf '403 Forbidden' ;;
+		404) printf '404 Not Found' ;;
+		408) printf '408 Request Timeout' ;;
+		429) printf '429 Too Many Requests' ;;
+		500) printf '500 Internal Server Error' ;;
+		502) printf '502 Bad Gateway' ;;
+		503) printf '503 Service Unavailable' ;;
+		504) printf '504 Gateway Timeout' ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+send_json() {
+	local status="$1" body="$2"
+	printf 'Status: %s\r\n' "$(header_status_text "$status")"
+	printf 'Content-Type: application/json\r\n'
+	printf 'Cache-Control: no-store\r\n'
+	printf '\r\n'
+	printf '%s\n' "$body"
+}
+
+error_json() {
+	local status="$1" message="$2" kind="${3:-proxy_error}"
+	send_json "$status" "{\"error\":\"$(json_escape "$message")\",\"type\":\"$(json_escape "$kind")\"}"
+}
+
+uci_get() {
+	uci -q get "$CONFIG.$1.$2"
+}
+
+secret_get() {
+	local section="$1" ref key
+	ref="$(uci_get "$section" api_key_ref)"
+	if [ -n "$ref" ] && [ -f "$ref" ]; then
+		sed -n '1p' "$ref"
+		return 0
+	fi
+	key="$(uci_get "$section" api_key)"
+	printf '%s' "$key"
+}
+
+find_enabled_section() {
+	local type="$1" sec
+	for sec in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.]*\)=$type$/\1/p"); do
+		[ "$(uci_get "$sec" enabled)" = "1" ] && {
+			printf '%s' "$sec"
+			return 0
+		}
+	done
+}
+
+current_section() {
+	local app="$1" section=""
+	case "$app" in
+		claude)
+			section="$(uci_get global current_claude)"
+			[ -n "$section" ] || section="$(find_enabled_section claude_provider)"
+		;;
+		codex)
+			section="$(uci_get global current_codex)"
+			[ -n "$section" ] || section="$(find_enabled_section codex_provider)"
+		;;
+	esac
+	printf '%s' "$section"
+}
+
+detect_app() {
+	case "$1" in
+		/health|/healthz) printf 'health' ;;
+		/v1/messages*) printf 'claude' ;;
+		/v1/complete*) printf 'claude' ;;
+		/v1/chat/completions*) printf 'codex' ;;
+		/v1/responses*) printf 'codex' ;;
+		/v1/models*) printf 'codex' ;;
+		*) printf '' ;;
+	esac
+}
+
+join_url() {
+	local base="$1" path="$2" full="$3"
+	base="${base%/}"
+	path="/${path#/}"
+
+	if [ "$full" = "1" ]; then
+		case "$path" in
+			/v1/messages|/v1/chat/completions|/v1/responses)
+				printf '%s' "$base"
+				return 0
+			;;
+		esac
+	fi
+
+	printf '%s%s' "$base" "$path"
+}
+
+replace_model() {
+	local file="$1" model="$2" tmp esc
+	[ -n "$model" ] || return 0
+	[ -s "$file" ] || return 0
+	tmp="$file.model"
+	esc="$(printf '%s' "$model" | sed 's/[\/&]/\\&/g')"
+	sed -E "s/\"model\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"model\":\"$esc\"/" "$file" > "$tmp" && mv "$tmp" "$file"
+}
+
+read_body() {
+	local file="$1" length="$2"
+	if [ -n "$length" ] && [ "$length" -gt 0 ] 2>/dev/null; then
+		dd of="$file" bs=1 count="$length" 2>/dev/null
+	else
+		cat > "$file"
+	fi
+}
+
+num_value() {
+	local value="$1"
+	awk -v v="$value" 'BEGIN { if (v ~ /^[0-9]+([.][0-9]+)?$/) print v; else print 0 }'
+}
+
+json_num() {
+	local file="$1" expr="$2" value
+	value="$(jsonfilter -i "$file" -e "$expr" 2>/dev/null | head -n 1)"
+	num_value "$value"
+}
+
+grep_num() {
+	local file="$1" key="$2" value
+	value="$(grep -o "\"$key\"[[:space:]]*:[[:space:]]*[0-9][0-9]*" "$file" 2>/dev/null | tail -n 1 | sed 's/.*:[[:space:]]*//')"
+	num_value "$value"
+}
+
+usage_num() {
+	local file="$1" expr="$2" key="$3" value
+	value="$(json_num "$file" "$expr")"
+	[ "$value" != "0" ] && {
+		printf '%s' "$value"
+		return 0
+	}
+	grep_num "$file" "$key"
+}
+
+sum_nums() {
+	awk 'BEGIN { s = 0; for (i = 1; i < ARGC; i++) s += ARGV[i]; printf "%.0f", s; exit }' "$@"
+}
+
+estimate_cost() {
+	local input="$1" output="$2" input_price="$3" output_price="$4"
+	awk -v i="$input" -v o="$output" -v ip="$input_price" -v op="$output_price" 'BEGIN { printf "%.8f", (i * ip / 1000000) + (o * op / 1000000) }'
+}
+
+diagnosis_type() {
+	local status="$1" body="$2"
+	case "$status" in
+		2*|3*) printf 'ok' ;;
+		400)
+			if grep -qi 'model' "$body" 2>/dev/null; then
+				printf 'model_or_request_error'
+			else
+				printf 'bad_request'
+			fi
+		;;
+		401|403) printf 'auth_error' ;;
+		404)
+			if grep -qi 'model' "$body" 2>/dev/null; then
+				printf 'model_not_found'
+			else
+				printf 'path_not_found'
+			fi
+		;;
+		408|504) printf 'timeout' ;;
+		429) printf 'rate_limited' ;;
+		5*) printf 'upstream_error' ;;
+		*) printf 'request_failed' ;;
+	esac
+}
+
+diagnosis_hint() {
+	local kind="$1"
+	case "$kind" in
+		ok) printf '请求成功' ;;
+		auth_error) printf '上游认证失败，请检查 API Key 或供应商认证方式' ;;
+		rate_limited) printf '上游限流或额度不足' ;;
+		model_not_found) printf '模型不存在或当前账号无权访问该模型' ;;
+		model_or_request_error) printf '请求参数或模型名称可能不兼容' ;;
+		path_not_found) printf '上游接口路径不存在，请检查 Base URL 和完整 URL 设置' ;;
+		timeout) printf '上游响应超时，请检查网络或调大超时时间' ;;
+		upstream_error) printf '上游服务返回 5xx 错误' ;;
+		bad_request) printf '上游认为请求格式有误' ;;
+		*) printf '请求失败，请查看响应内容或系统日志' ;;
+	esac
+}
+
+rotate_usage_log() {
+	local retain count tmp
+	retain="$(uci_get proxy usage_retain)"
+	[ -n "$retain" ] || retain="$DEFAULT_RETAIN"
+	[ "$retain" -gt 0 ] 2>/dev/null || retain="$DEFAULT_RETAIN"
+	[ -f "$LOG_FILE" ] || return 0
+	count="$(wc -l < "$LOG_FILE" 2>/dev/null | tr -d ' ')"
+	[ "$count" -gt "$retain" ] 2>/dev/null || return 0
+	tmp="$LOG_FILE.tmp.$$"
+	tail -n "$retain" "$LOG_FILE" > "$tmp" && mv "$tmp" "$LOG_FILE"
+	chmod 600 "$LOG_FILE" 2>/dev/null
+}
+
+append_usage() {
+	local app="$1" path="$2" provider="$3" upstream="$4" status="$5" started="$6" req_file="$7" resp_file="$8" model="$9" section="${10}"
+	local ended duration req_bytes resp_bytes input output cache_read cache_create cache_openai cache total input_price output_price cost kind hint log_requests
+
+	log_requests="$(uci_get proxy log_requests)"
+	[ "$log_requests" = "0" ] && return 0
+
+	ended="$(date +%s)"
+	duration=$(( (ended - started) * 1000 ))
+	req_bytes="$(wc -c < "$req_file" 2>/dev/null | tr -d ' ')"
+	resp_bytes="$(wc -c < "$resp_file" 2>/dev/null | tr -d ' ')"
+	[ -n "$req_bytes" ] || req_bytes=0
+	[ -n "$resp_bytes" ] || resp_bytes=0
+
+	input="$(usage_num "$resp_file" '@.usage.input_tokens' 'input_tokens')"
+	[ "$input" = "0" ] && input="$(usage_num "$resp_file" '@.usage.prompt_tokens' 'prompt_tokens')"
+	output="$(usage_num "$resp_file" '@.usage.output_tokens' 'output_tokens')"
+	[ "$output" = "0" ] && output="$(usage_num "$resp_file" '@.usage.completion_tokens' 'completion_tokens')"
+	cache_read="$(usage_num "$resp_file" '@.usage.cache_read_input_tokens' 'cache_read_input_tokens')"
+	cache_create="$(usage_num "$resp_file" '@.usage.cache_creation_input_tokens' 'cache_creation_input_tokens')"
+	cache_openai="$(usage_num "$resp_file" '@.usage.prompt_tokens_details.cached_tokens' 'cached_tokens')"
+	cache="$(sum_nums "$cache_read" "$cache_create" "$cache_openai")"
+	total="$(usage_num "$resp_file" '@.usage.total_tokens' 'total_tokens')"
+	[ "$total" = "0" ] && total="$(sum_nums "$input" "$output" "$cache")"
+
+	input_price="$(num_value "$(uci_get "$section" input_price_million)")"
+	output_price="$(num_value "$(uci_get "$section" output_price_million)")"
+	cost="$(estimate_cost "$input" "$output" "$input_price" "$output_price")"
+	kind="$(diagnosis_type "$status" "$resp_file")"
+	hint="$(diagnosis_hint "$kind")"
+
+	mkdir -p "$(dirname "$LOG_FILE")"
+	umask 077
+	{
+		printf '{"time":"%s",' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+		printf '"app":"%s",' "$(json_escape "$app")"
+		printf '"path":"%s",' "$(json_escape "$path")"
+		printf '"provider":"%s",' "$(json_escape "$provider")"
+		printf '"model":"%s",' "$(json_escape "$model")"
+		printf '"upstream":"%s",' "$(json_escape "$upstream")"
+		printf '"status":%s,' "$status"
+		printf '"error_type":"%s",' "$(json_escape "$kind")"
+		printf '"hint":"%s",' "$(json_escape "$hint")"
+		printf '"duration_ms":%s,' "$duration"
+		printf '"request_bytes":%s,' "$req_bytes"
+		printf '"response_bytes":%s,' "$resp_bytes"
+		printf '"input_tokens":%s,' "$input"
+		printf '"output_tokens":%s,' "$output"
+		printf '"cache_tokens":%s,' "$cache"
+		printf '"total_tokens":%s,' "$total"
+		printf '"input_price_million":%s,' "$input_price"
+		printf '"output_price_million":%s,' "$output_price"
+		printf '"estimated_cost":%s' "$cost"
+		printf '}\n'
+	} >> "$LOG_FILE"
+	chmod 600 "$LOG_FILE" 2>/dev/null
+	rotate_usage_log
+}
+
+curl_config_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+write_curl_config() {
+	local file="$1" method="$2" url="$3" req_file="$4" timeout="$5" content_type="$6" app="$7" api_key="$8" key_field="$9" beta="${10}" version="${11}"
+
+	{
+		printf 'url = "%s"\n' "$(curl_config_escape "$url")"
+		printf 'request = "%s"\n' "$(curl_config_escape "$method")"
+		printf 'connect-timeout = 15\n'
+		printf 'max-time = %s\n' "$timeout"
+		printf 'silent\n'
+		printf 'show-error\n'
+		printf 'header = "Content-Type: %s"\n' "$(curl_config_escape "$content_type")"
+		case "$app" in
+			claude)
+				if [ "$key_field" = "ANTHROPIC_API_KEY" ]; then
+					printf 'header = "x-api-key: %s"\n' "$(curl_config_escape "$api_key")"
+				else
+					printf 'header = "Authorization: Bearer %s"\n' "$(curl_config_escape "$api_key")"
+				fi
+				printf 'header = "anthropic-version: %s"\n' "$(curl_config_escape "$version")"
+				[ -n "$beta" ] && printf 'header = "anthropic-beta: %s"\n' "$(curl_config_escape "$beta")"
+			;;
+			codex)
+				printf 'header = "Authorization: Bearer %s"\n' "$(curl_config_escape "$api_key")"
+			;;
+		esac
+		if [ -s "$req_file" ]; then
+			printf 'data-binary = "@%s"\n' "$(curl_config_escape "$req_file")"
+		fi
+	} > "$file"
+}
+
+extract_status() {
+	awk '/^HTTP\// { code=$2 } END { if (code) print code; else print 502 }' "$1" 2>/dev/null
+}
+
+extract_content_type() {
+	awk 'BEGIN { IGNORECASE=1 } /^Content-Type:/ { sub(/\r$/, ""); sub(/^[^:]+:[[:space:]]*/, ""); ct=$0 } END { if (ct) print ct; else print "application/json" }' "$1" 2>/dev/null
+}
+
+wait_for_headers() {
+	local file="$1" i=0
+	while [ "$i" -lt 10 ]; do
+		[ -s "$file" ] && return 0
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+proxy_with_curl_buffered() {
+	local method="$1" upstream="$2" req_file="$3" timeout="$4" content_type="$5" app="$6" api_key="$7" key_field="$8" beta="$9" version="${10}" started="${11}" provider="${12}" path="${13}" model="${14}" section="${15}"
+	local base conf headers body status ct
+	base="/tmp/ccswitch-proxy.$$"
+	conf="$base.curl"
+	headers="$base.headers"
+	body="$base.body"
+
+	write_curl_config "$conf" "$method" "$upstream" "$req_file" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version"
+	if ! curl -K "$conf" -D "$headers" -o "$body" >/dev/null 2>&1; then
+		echo '{"error":"upstream request failed","type":"network_error"}' > "$body"
+		status=502
+		ct="application/json"
+	else
+		status="$(extract_status "$headers")"
+		ct="$(extract_content_type "$headers")"
+	fi
+
+	append_usage "$app" "$path" "$provider" "$upstream" "$status" "$started" "$req_file" "$body" "$model" "$section"
+	printf 'Status: %s\r\n' "$(header_status_text "$status")"
+	printf 'Content-Type: %s\r\n' "$ct"
+	printf 'Cache-Control: no-store\r\n'
+	printf '\r\n'
+	cat "$body"
+	rm -f "$conf" "$headers" "$body"
+}
+
+proxy_with_curl_stream() {
+	local method="$1" upstream="$2" req_file="$3" timeout="$4" content_type="$5" app="$6" api_key="$7" key_field="$8" beta="$9" version="${10}" started="${11}" provider="${12}" path="${13}" model="${14}" section="${15}"
+	local base conf headers body fifo status ct pid rc
+	base="/tmp/ccswitch-proxy.$$"
+	conf="$base.curl"
+	headers="$base.headers"
+	body="$base.body"
+	fifo="$base.fifo"
+	: > "$body"
+
+	write_curl_config "$conf" "$method" "$upstream" "$req_file" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version"
+	if ! mkfifo "$fifo" 2>/dev/null; then
+		proxy_with_curl_buffered "$method" "$upstream" "$req_file" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version" "$started" "$provider" "$path" "$model" "$section"
+		rm -f "$conf" "$headers" "$body" "$fifo"
+		return 0
+	fi
+
+	curl -N -K "$conf" -D "$headers" > "$fifo" 2>/dev/null &
+	pid="$!"
+	wait_for_headers "$headers"
+	status="$(extract_status "$headers")"
+	ct="$(extract_content_type "$headers")"
+	[ -n "$status" ] || status=502
+	[ -n "$ct" ] || ct="text/event-stream"
+
+	printf 'Status: %s\r\n' "$(header_status_text "$status")"
+	printf 'Content-Type: %s\r\n' "$ct"
+	printf 'Cache-Control: no-store\r\n'
+	printf '\r\n'
+	tee "$body" < "$fifo"
+	wait "$pid"
+	rc="$?"
+	if [ "$rc" != "0" ] && [ "$status" -lt 400 ] 2>/dev/null; then
+		status=502
+	fi
+
+	append_usage "$app" "$path" "$provider" "$upstream" "$status" "$started" "$req_file" "$body" "$model" "$section"
+	rm -f "$conf" "$headers" "$body" "$fifo"
+}
+
+main() {
+	local started path app section type provider base_url api_key model key_field is_full_url timeout content_type req_file upstream method stream beta version
+
+	started="$(date +%s)"
+	path="${REQUEST_URI%%\?*}"
+	[ -n "$path" ] || path="${SCRIPT_NAME:-/}${PATH_INFO:-}"
+	method="${REQUEST_METHOD:-GET}"
+
+	app="$(detect_app "$path")"
+	if [ "$app" = "health" ]; then
+		send_json 200 '{"ok":true,"service":"ccswitch-proxy"}'
+		return 0
+	fi
+
+	[ -n "$app" ] || {
+		error_json 404 "unsupported proxy path" "path_not_found"
+		return 0
+	}
+
+	if ! command -v curl >/dev/null 2>&1; then
+		error_json 503 "curl is required for proxy routing" "missing_dependency"
+		return 0
+	fi
+
+	section="$(current_section "$app")"
+	[ -n "$section" ] || {
+		error_json 400 "no active provider configured" "provider_missing"
+		return 0
+	}
+
+	case "$app" in
+		claude) type="claude_provider" ;;
+		codex) type="codex_provider" ;;
+	esac
+
+	[ "$(uci -q get "$CONFIG.$section")" = "$type" ] || {
+		error_json 400 "active provider has invalid type" "provider_type_error"
+		return 0
+	}
+
+	provider="$(uci_get "$section" name)"
+	base_url="$(uci_get "$section" base_url)"
+	api_key="$(secret_get "$section")"
+	model="$(uci_get "$section" model)"
+	key_field="$(uci_get "$section" api_key_field)"
+	is_full_url="$(uci_get "$section" is_full_url)"
+	timeout="$(uci_get proxy upstream_timeout)"
+	content_type="${CONTENT_TYPE:-application/json}"
+	beta="${HTTP_ANTHROPIC_BETA:-}"
+	version="${HTTP_ANTHROPIC_VERSION:-2023-06-01}"
+	[ -n "$timeout" ] || timeout="$DEFAULT_TIMEOUT"
+	[ -n "$key_field" ] || key_field="ANTHROPIC_AUTH_TOKEN"
+
+	[ -n "$base_url" ] || {
+		error_json 400 "provider Base URL is empty" "provider_config_error"
+		return 0
+	}
+	[ -n "$api_key" ] || {
+		error_json 400 "provider API Key is empty" "provider_config_error"
+		return 0
+	}
+	[ -n "$model" ] || {
+		error_json 400 "provider model is empty" "provider_config_error"
+		return 0
+	}
+
+	req_file="/tmp/ccswitch-proxy.$$.request"
+	read_body "$req_file" "${CONTENT_LENGTH:-0}"
+	replace_model "$req_file" "$model"
+	upstream="$(join_url "$base_url" "$path" "$is_full_url")"
+
+	if grep -q '"stream"[[:space:]]*:[[:space:]]*true' "$req_file" 2>/dev/null; then
+		stream=1
+	else
+		stream=0
+	fi
+
+	if [ "$stream" = "1" ]; then
+		proxy_with_curl_stream "$method" "$upstream" "$req_file" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version" "$started" "$provider" "$path" "$model" "$section"
+	else
+		proxy_with_curl_buffered "$method" "$upstream" "$req_file" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version" "$started" "$provider" "$path" "$model" "$section"
+	fi
+
+	rm -f "$req_file" "$req_file.model"
+}
+
+main

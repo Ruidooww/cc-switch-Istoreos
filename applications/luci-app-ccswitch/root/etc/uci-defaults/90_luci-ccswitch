@@ -1,0 +1,144 @@
+#!/bin/sh
+
+[ -d /etc/ccswitch/backups ] || mkdir -p /etc/ccswitch/backups
+[ -d /etc/ccswitch/secrets ] || mkdir -p /etc/ccswitch/secrets
+chmod 700 /etc/ccswitch/secrets 2>/dev/null
+
+ccswitch_has_provider() {
+	local name="$1"
+	uci -q show ccswitch | grep -F ".name='$name'" >/dev/null 2>&1
+}
+
+ccswitch_add_claude_provider() {
+	local section
+	ccswitch_has_provider "$1" && return 0
+	section="$(uci -q add ccswitch claude_provider)" || return 0
+	uci -q set ccswitch."$section".name="$1"
+	uci -q set ccswitch."$section".preset="$2"
+	uci -q set ccswitch."$section".enabled='0'
+	uci -q set ccswitch."$section".website_url="$3"
+	uci -q set ccswitch."$section".base_url="$4"
+	uci -q set ccswitch."$section".is_full_url='0'
+	uci -q set ccswitch."$section".api_key=''
+	uci -q set ccswitch."$section".api_key_ref=''
+	uci -q set ccswitch."$section".api_format='anthropic'
+	uci -q set ccswitch."$section".api_key_field="$5"
+	uci -q set ccswitch."$section".model="$6"
+	uci -q set ccswitch."$section".haiku_model="$7"
+	uci -q set ccswitch."$section".sonnet_model="$8"
+	uci -q set ccswitch."$section".opus_model="$9"
+	uci -q set ccswitch."$section".input_price_million='0'
+	uci -q set ccswitch."$section".output_price_million='0'
+	uci -q set ccswitch."$section".notes="${10}"
+}
+
+ccswitch_add_codex_provider() {
+	local section
+	ccswitch_has_provider "$1" && return 0
+	section="$(uci -q add ccswitch codex_provider)" || return 0
+	uci -q set ccswitch."$section".name="$1"
+	uci -q set ccswitch."$section".preset="$2"
+	uci -q set ccswitch."$section".enabled='0'
+	uci -q set ccswitch."$section".base_url="$3"
+	uci -q set ccswitch."$section".api_key=''
+	uci -q set ccswitch."$section".api_key_ref=''
+	uci -q set ccswitch."$section".model="$4"
+	uci -q set ccswitch."$section".wire_api="$5"
+	uci -q set ccswitch."$section".input_price_million='0'
+	uci -q set ccswitch."$section".output_price_million='0'
+	uci -q set ccswitch."$section".notes="$6"
+}
+
+ccswitch_secret_path() {
+	printf '/etc/ccswitch/secrets/%s.key' "$1"
+}
+
+ccswitch_write_secret() {
+	local section="$1" key="$2" path
+	[ -n "$key" ] || return 0
+	path="$(ccswitch_secret_path "$section")"
+	mkdir -p /etc/ccswitch/secrets || return 1
+	chmod 700 /etc/ccswitch/secrets 2>/dev/null
+	umask 077
+	printf '%s' "$key" > "$path" || return 1
+	chmod 600 "$path" 2>/dev/null
+	uci -q set ccswitch."$section".api_key_ref="$path"
+	uci -q delete ccswitch."$section".api_key
+}
+
+ccswitch_migrate_provider_secrets() {
+	local sec key ref
+	for sec in $(uci -q show ccswitch | sed -n "s/^ccswitch\.\([^.]*\)=.*_provider$/\1/p"); do
+		key="$(uci -q get ccswitch."$sec".api_key)"
+		ref="$(uci -q get ccswitch."$sec".api_key_ref)"
+		if [ -n "$key" ] && [ "$key" != "********" ] && [ -z "$ref" ]; then
+			ccswitch_write_secret "$sec" "$key"
+		fi
+		[ -n "$(uci -q get ccswitch."$sec".input_price_million)" ] || uci -q set ccswitch."$sec".input_price_million='0'
+		[ -n "$(uci -q get ccswitch."$sec".output_price_million)" ] || uci -q set ccswitch."$sec".output_price_million='0'
+	done
+}
+
+if [ -z "$(uci -q get ccswitch.global)" ]; then
+	uci -q set ccswitch.global='global'
+	uci -q set ccswitch.global.claude_config_dir='/root/.claude'
+	uci -q set ccswitch.global.codex_config_dir='/root/.codex'
+	uci -q set ccswitch.global.backup_dir='/etc/ccswitch/backups'
+	uci -q set ccswitch.global.backup_retain='10'
+fi
+
+[ -n "$(uci -q get ccswitch.global.claude_route_mode)" ] || uci -q set ccswitch.global.claude_route_mode='direct'
+[ -n "$(uci -q get ccswitch.global.codex_route_mode)" ] || uci -q set ccswitch.global.codex_route_mode='direct'
+
+if [ -z "$(uci -q get ccswitch.proxy)" ]; then
+	uci -q set ccswitch.proxy='proxy'
+	uci -q set ccswitch.proxy.enabled='0'
+	uci -q set ccswitch.proxy.listen_address='127.0.0.1'
+	uci -q set ccswitch.proxy.listen_port='15721'
+	uci -q set ccswitch.proxy.log_requests='1'
+	uci -q set ccswitch.proxy.upstream_timeout='600'
+	uci -q set ccswitch.proxy.usage_retain='2000'
+fi
+
+[ -n "$(uci -q get ccswitch.proxy.usage_retain)" ] || uci -q set ccswitch.proxy.usage_retain='2000'
+
+ccswitch_add_claude_provider 'Anthropic Compatible' 'anthropic' 'https://console.anthropic.com' 'https://api.anthropic.com' 'ANTHROPIC_AUTH_TOKEN' 'claude-sonnet-4-5' 'claude-haiku-4-5' 'claude-sonnet-4-5' 'claude-opus-4-1' 'Native Anthropic-compatible endpoint.'
+ccswitch_add_claude_provider 'Claude Proxy Compatible' 'newapi_anthropic' 'https://example.com' 'https://example.com/anthropic' 'ANTHROPIC_AUTH_TOKEN' 'claude-sonnet-4-5' 'claude-sonnet-4-5' 'claude-sonnet-4-5' 'claude-sonnet-4-5' 'Use when your gateway exposes an Anthropic-compatible Claude endpoint.'
+ccswitch_add_claude_provider 'DeepSeek Anthropic' 'deepseek_anthropic' 'https://platform.deepseek.com' 'https://api.deepseek.com/anthropic' 'ANTHROPIC_AUTH_TOKEN' 'deepseek-v4-pro' 'deepseek-v4-pro' 'deepseek-v4-pro' 'deepseek-v4-pro' 'DeepSeek Anthropic-compatible endpoint example.'
+
+ccswitch_add_codex_provider 'OpenAI Compatible' 'openai' 'https://api.openai.com/v1' 'gpt-5.1-codex' 'responses' 'OpenAI Responses API-compatible endpoint.'
+ccswitch_add_codex_provider 'NewAPI' 'newapi' 'https://example.com/v1' 'gpt-5.1-codex' 'responses' 'Replace Base URL with your NewAPI endpoint.'
+ccswitch_add_codex_provider 'OpenRouter' 'openrouter' 'https://openrouter.ai/api/v1' 'openai/gpt-5' 'chat' 'OpenRouter usually uses Chat Completions-compatible routing.'
+ccswitch_add_codex_provider 'DeepSeek' 'deepseek' 'https://api.deepseek.com/v1' 'deepseek-chat' 'chat' 'DeepSeek is OpenAI Chat-compatible.'
+ccswitch_add_codex_provider 'SiliconFlow' 'siliconflow' 'https://api.siliconflow.cn/v1' 'deepseek-ai/DeepSeek-V3.1' 'chat' 'SiliconFlow OpenAI-compatible endpoint.'
+ccswitch_add_codex_provider 'Moonshot Kimi' 'moonshot' 'https://api.moonshot.cn/v1' 'kimi-k2-0905-preview' 'chat' 'Moonshot Kimi OpenAI-compatible endpoint.'
+ccswitch_add_codex_provider 'Qwen DashScope' 'qwen' 'https://dashscope.aliyuncs.com/compatible-mode/v1' 'qwen3-coder-plus' 'chat' 'Alibaba DashScope OpenAI-compatible mode.'
+ccswitch_add_codex_provider 'Zhipu GLM' 'zhipu' 'https://open.bigmodel.cn/api/paas/v4' 'glm-4.6' 'chat' 'Zhipu GLM OpenAI-compatible endpoint.'
+ccswitch_add_codex_provider 'Volcengine Ark' 'volcengine' 'https://ark.cn-beijing.volces.com/api/v3' 'doubao-seed-code' 'chat' 'Volcengine Ark OpenAI-compatible endpoint.'
+
+ccswitch_migrate_provider_secrets
+
+uci -q commit ccswitch
+
+rm -f /tmp/luci-indexcache
+rm -f /tmp/luci-modulecache/* 2>/dev/null
+
+if [ -x /etc/init.d/rpcd ]; then
+	/etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1
+fi
+
+chmod 755 /usr/libexec/ccswitch-proxy-cgi 2>/dev/null
+chmod 755 /usr/share/ccswitch/proxy-www/health 2>/dev/null
+chmod 755 /usr/share/ccswitch/proxy-www/v1/messages 2>/dev/null
+chmod 755 /usr/share/ccswitch/proxy-www/v1/responses 2>/dev/null
+chmod 755 /usr/share/ccswitch/proxy-www/v1/models 2>/dev/null
+chmod 755 /usr/share/ccswitch/proxy-www/v1/chat/completions 2>/dev/null
+
+if [ -x /etc/init.d/ccswitch-proxy ]; then
+	/etc/init.d/ccswitch-proxy enable >/dev/null 2>&1
+	/etc/init.d/ccswitch-proxy restart >/dev/null 2>&1
+fi
+
+rm -f /etc/uci-defaults/90_luci-ccswitch
+
+exit 0

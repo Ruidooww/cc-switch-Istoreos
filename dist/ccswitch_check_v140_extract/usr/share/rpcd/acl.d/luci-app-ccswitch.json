@@ -1,0 +1,18 @@
+{
+	"luci-app-ccswitch": {
+		"description": "Grant access to CC Switch provider switching",
+		"read": {
+			"ubus": {
+				"ccswitch": [ "status", "backups", "proxy_status", "usage", "usage_export" ]
+			},
+			"uci": [ "ccswitch" ]
+		},
+		"write": {
+			"ubus": {
+				"ccswitch": [ "apply", "restore", "proxy_restart", "usage_clear", "usage_trim" ],
+				"uci": [ "add", "set", "delete", "order", "commit" ]
+			},
+			"uci": [ "ccswitch" ]
+		}
+	}
+}

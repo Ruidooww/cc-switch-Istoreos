@@ -1,0 +1,8 @@
+Package: luci-app-ccswitch
+Version: 1.0.0-2
+Depends: luci-base, rpcd, jsonfilter
+Architecture: all
+Maintainer: Codex
+Section: luci
+Priority: optional
+Description: LuCI support for CC Switch provider switching

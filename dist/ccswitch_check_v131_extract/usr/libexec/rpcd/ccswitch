@@ -1,0 +1,564 @@
+#!/bin/sh
+
+CONFIG="ccswitch"
+DEFAULT_CLAUDE_DIR="/root/.claude"
+DEFAULT_CODEX_DIR="/root/.codex"
+DEFAULT_BACKUP_DIR="/etc/ccswitch/backups"
+DEFAULT_RETAIN="10"
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+toml_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_bool() {
+	[ "$1" = "1" ] && printf 'true' || printf 'false'
+}
+
+json_error() {
+	printf '{"ok":false,"error":"%s"}\n' "$(json_escape "$1")"
+}
+
+json_ok() {
+	printf '{"ok":true,"message":"%s"}\n' "$(json_escape "$1")"
+}
+
+json_arg() {
+	jsonfilter -s "$1" -e "$2" 2>/dev/null
+}
+
+global_get() {
+	local key="$1" default="$2" value
+	value="$(uci -q get "$CONFIG.global.$key")"
+	[ -n "$value" ] && printf '%s' "$value" || printf '%s' "$default"
+}
+
+section_get() {
+	local section="$1" key="$2"
+	uci -q get "$CONFIG.$section.$key"
+}
+
+validate_section() {
+	local section="$1" expected="$2" actual
+
+	case "$section" in
+	''|*[!A-Za-z0-9_]*)
+		json_error "供应商配置段无效"
+		return 1
+	;;
+	esac
+
+	actual="$(uci -q get "$CONFIG.$section")"
+	if [ "$actual" != "$expected" ]; then
+		json_error "供应商类型不匹配"
+		return 1
+	fi
+
+	return 0
+}
+
+require_value() {
+	local value="$1" label="$2"
+	if [ -z "$value" ]; then
+		json_error "$label 不能为空"
+		return 1
+	fi
+	return 0
+}
+
+valid_url() {
+	case "$1" in
+		http://*|https://*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+timestamp() {
+	date '+%Y%m%d-%H%M%S'
+}
+
+backup_dir() {
+	global_get backup_dir "$DEFAULT_BACKUP_DIR"
+}
+
+backup_retain() {
+	global_get backup_retain "$DEFAULT_RETAIN"
+}
+
+cleanup_backups() {
+	local dir="$1" retain="$2" item count
+	[ -d "$dir" ] || return 0
+	[ "$retain" -gt 0 ] 2>/dev/null || retain="$DEFAULT_RETAIN"
+
+	count=0
+	for item in $(ls -1t "$dir" 2>/dev/null); do
+		count=$((count + 1))
+		[ "$count" -le "$retain" ] && continue
+		rm -f "$dir/$item"
+	done
+}
+
+backup_file() {
+	local app="$1" path="$2" dir base stamp retain
+
+	[ -f "$path" ] || return 0
+
+	dir="$(backup_dir)/$app"
+	base="$(basename "$path")"
+	stamp="$(timestamp)"
+	retain="$(backup_retain)"
+
+	mkdir -p "$dir" || return 1
+	cp "$path" "$dir/$base.$stamp" || return 1
+	cleanup_backups "$dir" "$retain"
+}
+
+write_atomic() {
+	local path="$1" tmp
+	tmp="$path.tmp.$$"
+	mkdir -p "$(dirname "$path")" || return 1
+	umask 077
+	cat > "$tmp" || return 1
+	mv "$tmp" "$path" || {
+		rm -f "$tmp"
+		return 1
+	}
+	chmod 600 "$path" 2>/dev/null
+}
+
+normalize_codex_base_url() {
+	local url
+	url="${1%/}"
+
+	case "$url" in
+		*/v1) printf '%s' "$url" ;;
+		http://*/*|https://*/*) printf '%s' "$url" ;;
+		*) printf '%s/v1' "$url" ;;
+	esac
+}
+
+apply_claude() {
+	local section="$1" name base_url api_key api_format api_key_field model haiku_model sonnet_model opus_model hide_ai_signature teammates_mode enable_tool_search max_thinking_enabled disable_auto_update dir path
+
+	validate_section "$section" "claude_provider" || return 0
+
+	name="$(section_get "$section" name)"
+	base_url="$(section_get "$section" base_url)"
+	api_key="$(section_get "$section" api_key)"
+	api_format="$(section_get "$section" api_format)"
+	api_key_field="$(section_get "$section" api_key_field)"
+	model="$(section_get "$section" model)"
+	haiku_model="$(section_get "$section" haiku_model)"
+	sonnet_model="$(section_get "$section" sonnet_model)"
+	opus_model="$(section_get "$section" opus_model)"
+	hide_ai_signature="$(section_get "$section" hide_ai_signature)"
+	teammates_mode="$(section_get "$section" teammates_mode)"
+	enable_tool_search="$(section_get "$section" enable_tool_search)"
+	max_thinking_enabled="$(section_get "$section" max_thinking_enabled)"
+	disable_auto_update="$(section_get "$section" disable_auto_update)"
+	[ -n "$api_format" ] || api_format="anthropic"
+	[ -n "$api_key_field" ] || api_key_field="ANTHROPIC_AUTH_TOKEN"
+	[ -n "$haiku_model" ] || haiku_model="$model"
+	[ -n "$sonnet_model" ] || sonnet_model="$model"
+	[ -n "$opus_model" ] || opus_model="$model"
+
+	require_value "$name" "名称" || return 0
+	require_value "$base_url" "请求地址" || return 0
+	require_value "$api_key" "API Key" || return 0
+	require_value "$model" "模型" || return 0
+
+	valid_url "$base_url" || {
+		json_error "请求地址必须以 http:// 或 https:// 开头"
+		return 0
+	}
+
+	case "$api_key_field" in
+		ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY) ;;
+		*)
+			json_error "不支持的 Claude 认证字段"
+			return 0
+		;;
+	esac
+
+	case "$api_format" in
+		anthropic) ;;
+		openai_chat|openai_responses)
+			json_error "Claude 直写模式目前只支持 Anthropic 兼容环境变量。请使用 Anthropic 兼容网关地址。"
+			return 0
+		;;
+		*)
+			json_error "不支持的 Claude API 格式"
+			return 0
+		;;
+	esac
+
+	dir="$(global_get claude_config_dir "$DEFAULT_CLAUDE_DIR")"
+	path="$dir/settings.json"
+
+	backup_file claude "$path" || {
+		json_error "创建 Claude 备份失败"
+		return 0
+	}
+
+	{
+		printf '{\n'
+		printf '  "env": {\n'
+		printf '    "ANTHROPIC_BASE_URL": "%s",\n' "$(json_escape "$base_url")"
+		printf '    "%s": "%s",\n' "$api_key_field" "$(json_escape "$api_key")"
+		printf '    "ANTHROPIC_MODEL": "%s",\n' "$(json_escape "$model")"
+		printf '    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "%s",\n' "$(json_escape "$haiku_model")"
+		printf '    "ANTHROPIC_DEFAULT_SONNET_MODEL": "%s",\n' "$(json_escape "$sonnet_model")"
+		printf '    "ANTHROPIC_DEFAULT_OPUS_MODEL": "%s"' "$(json_escape "$opus_model")"
+		[ "$max_thinking_enabled" = "1" ] && printf ',\n    "MAX_THINKING_TOKENS": "32000"'
+		printf '\n'
+		printf '  }'
+		[ "$hide_ai_signature" = "1" ] && printf ',\n  "includeCoAuthoredBy": false'
+		[ "$teammates_mode" = "1" ] && printf ',\n  "forceLoginMethod": "console"'
+		[ "$enable_tool_search" = "1" ] && printf ',\n  "enableToolSearch": true'
+		[ "$disable_auto_update" = "1" ] && printf ',\n  "disableAutoUpdate": true'
+		printf '\n'
+		printf '}\n'
+	} | write_atomic "$path" || {
+		json_error "写入 Claude settings.json 失败"
+		return 0
+	}
+
+	uci -q set "$CONFIG.global.current_claude=$section"
+	uci -q set "$CONFIG.$section.enabled=1"
+	uci -q commit "$CONFIG"
+	logger -t ccswitch "Claude provider '$name' applied to $path"
+	json_ok "Claude 供应商已启用"
+}
+
+apply_codex() {
+	local section="$1" name base_url api_key model wire_api dir auth_path config_path codex_base_url
+
+	validate_section "$section" "codex_provider" || return 0
+
+	name="$(section_get "$section" name)"
+	base_url="$(section_get "$section" base_url)"
+	api_key="$(section_get "$section" api_key)"
+	model="$(section_get "$section" model)"
+	wire_api="$(section_get "$section" wire_api)"
+	[ -n "$wire_api" ] || wire_api="responses"
+
+	require_value "$name" "名称" || return 0
+	require_value "$base_url" "请求地址" || return 0
+	require_value "$api_key" "API Key" || return 0
+	require_value "$model" "模型" || return 0
+
+	valid_url "$base_url" || {
+		json_error "请求地址必须以 http:// 或 https:// 开头"
+		return 0
+	}
+
+	case "$wire_api" in
+		responses|chat) ;;
+		*)
+			json_error "不支持的 Codex 接口类型"
+			return 0
+		;;
+	esac
+
+	dir="$(global_get codex_config_dir "$DEFAULT_CODEX_DIR")"
+	auth_path="$dir/auth.json"
+	config_path="$dir/config.toml"
+	codex_base_url="$(normalize_codex_base_url "$base_url")"
+
+	backup_file codex "$auth_path" || {
+		json_error "创建 Codex 认证备份失败"
+		return 0
+	}
+	backup_file codex "$config_path" || {
+		json_error "创建 Codex 配置备份失败"
+		return 0
+	}
+
+	{
+		printf '{\n'
+		printf '  "OPENAI_API_KEY": "%s"\n' "$(json_escape "$api_key")"
+		printf '}\n'
+	} | write_atomic "$auth_path" || {
+		json_error "写入 Codex auth.json 失败"
+		return 0
+	}
+
+	{
+		printf 'model_provider = "ccswitch"\n'
+		printf 'model = "%s"\n\n' "$(toml_escape "$model")"
+		printf '[model_providers.ccswitch]\n'
+		printf 'name = "CC Switch"\n'
+		printf 'base_url = "%s"\n' "$(toml_escape "$codex_base_url")"
+		printf 'wire_api = "%s"\n' "$(toml_escape "$wire_api")"
+		printf 'requires_openai_auth = true\n'
+	} | write_atomic "$config_path" || {
+		json_error "写入 Codex config.toml 失败"
+		return 0
+	}
+
+	uci -q set "$CONFIG.global.current_codex=$section"
+	uci -q set "$CONFIG.$section.enabled=1"
+	uci -q commit "$CONFIG"
+	logger -t ccswitch "Codex provider '$name' applied to $dir"
+	json_ok "Codex 供应商已启用"
+}
+
+list_backups_json() {
+	local app="$1" dir item first path
+	dir="$(backup_dir)/$app"
+	first=1
+	printf '['
+	if [ -d "$dir" ]; then
+		for item in $(ls -1t "$dir" 2>/dev/null | head -n 20); do
+			path="$dir/$item"
+			[ "$first" = "1" ] || printf ','
+			first=0
+			printf '"%s"' "$(json_escape "$path")"
+		done
+	fi
+	printf ']'
+}
+
+status_app() {
+	local app="$1" current current_name claude_dir codex_dir backup exists1 exists2
+
+	backup="$(backup_dir)"
+
+	case "$app" in
+		claude)
+			current="$(global_get current_claude "")"
+			current_name="$(section_get "$current" name)"
+			claude_dir="$(global_get claude_config_dir "$DEFAULT_CLAUDE_DIR")"
+			[ -f "$claude_dir/settings.json" ] && exists1=1 || exists1=0
+			printf '{"ok":true,"app":"claude","current":"%s","current_name":"%s","paths":["%s"],"exists":[%s],"backup_dir":"%s","backups":' \
+				"$(json_escape "$current")" \
+				"$(json_escape "$current_name")" \
+				"$(json_escape "$claude_dir/settings.json")" \
+				"$(json_bool "$exists1")" \
+				"$(json_escape "$backup/claude")"
+			list_backups_json claude
+			printf '}\n'
+		;;
+		codex)
+			current="$(global_get current_codex "")"
+			current_name="$(section_get "$current" name)"
+			codex_dir="$(global_get codex_config_dir "$DEFAULT_CODEX_DIR")"
+			[ -f "$codex_dir/auth.json" ] && exists1=1 || exists1=0
+			[ -f "$codex_dir/config.toml" ] && exists2=1 || exists2=0
+			printf '{"ok":true,"app":"codex","current":"%s","current_name":"%s","paths":["%s","%s"],"exists":[%s,%s],"backup_dir":"%s","backups":' \
+				"$(json_escape "$current")" \
+				"$(json_escape "$current_name")" \
+				"$(json_escape "$codex_dir/auth.json")" \
+				"$(json_escape "$codex_dir/config.toml")" \
+				"$(json_bool "$exists1")" \
+				"$(json_bool "$exists2")" \
+				"$(json_escape "$backup/codex")"
+			list_backups_json codex
+			printf '}\n'
+		;;
+		*)
+			json_error "不支持的应用"
+		;;
+	esac
+}
+
+restore_latest_claude() {
+	local dir target latest
+	dir="$(backup_dir)/claude"
+	target="$(global_get claude_config_dir "$DEFAULT_CLAUDE_DIR")/settings.json"
+	latest="$(ls -1t "$dir"/settings.json.* 2>/dev/null | head -n 1)"
+
+	[ -n "$latest" ] || {
+		json_error "未找到 Claude 备份"
+		return 0
+	}
+
+	backup_file claude "$target" >/dev/null 2>&1
+	mkdir -p "$(dirname "$target")" || {
+		json_error "创建 Claude 配置目录失败"
+		return 0
+	}
+	cp "$latest" "$target" && chmod 600 "$target" 2>/dev/null || {
+		json_error "恢复 Claude 备份失败"
+		return 0
+	}
+
+	logger -t ccswitch "Claude backup restored from $latest"
+	json_ok "Claude 备份已恢复"
+}
+
+restore_latest_codex() {
+	local dir codex_dir latest base stamp auth_backup config_backup
+	dir="$(backup_dir)/codex"
+	codex_dir="$(global_get codex_config_dir "$DEFAULT_CODEX_DIR")"
+	latest="$(ls -1t "$dir"/config.toml.* "$dir"/auth.json.* 2>/dev/null | head -n 1)"
+
+	[ -n "$latest" ] || {
+		json_error "未找到 Codex 备份"
+		return 0
+	}
+
+	base="$(basename "$latest")"
+	case "$base" in
+		config.toml.*) stamp="${base#config.toml.}" ;;
+		auth.json.*) stamp="${base#auth.json.}" ;;
+		*) stamp="" ;;
+	esac
+
+	[ -n "$stamp" ] || {
+		json_error "Codex 备份文件名无效"
+		return 0
+	}
+
+	auth_backup="$dir/auth.json.$stamp"
+	config_backup="$dir/config.toml.$stamp"
+	mkdir -p "$codex_dir" || {
+		json_error "创建 Codex 配置目录失败"
+		return 0
+	}
+
+	backup_file codex "$codex_dir/auth.json" >/dev/null 2>&1
+	backup_file codex "$codex_dir/config.toml" >/dev/null 2>&1
+
+	[ -f "$auth_backup" ] && cp "$auth_backup" "$codex_dir/auth.json"
+	[ -f "$config_backup" ] && cp "$config_backup" "$codex_dir/config.toml"
+	chmod 600 "$codex_dir/auth.json" "$codex_dir/config.toml" 2>/dev/null
+
+	logger -t ccswitch "Codex backup restored from stamp $stamp"
+	json_ok "Codex 备份已恢复"
+}
+
+restore_app() {
+	case "$1" in
+		claude) restore_latest_claude ;;
+		codex) restore_latest_codex ;;
+		*) json_error "不支持的应用" ;;
+	esac
+}
+
+proxy_status() {
+	local enabled address port timeout running client log_file
+	enabled="$(uci -q get "$CONFIG.proxy.enabled")"
+	address="$(uci -q get "$CONFIG.proxy.listen_address")"
+	port="$(uci -q get "$CONFIG.proxy.listen_port")"
+	timeout="$(uci -q get "$CONFIG.proxy.upstream_timeout")"
+	log_file="/etc/ccswitch/usage.jsonl"
+	[ -n "$enabled" ] || enabled=0
+	[ -n "$address" ] || address="127.0.0.1"
+	[ -n "$port" ] || port="15721"
+	[ -n "$timeout" ] || timeout="600"
+
+	if /etc/init.d/ccswitch-proxy running >/dev/null 2>&1; then
+		running=1
+	else
+		running=0
+	fi
+
+	if command -v curl >/dev/null 2>&1; then
+		client="curl"
+	elif command -v uclient-fetch >/dev/null 2>&1; then
+		client="uclient-fetch"
+	elif command -v wget >/dev/null 2>&1; then
+		client="wget"
+	else
+		client=""
+	fi
+
+	printf '{"ok":true,"enabled":%s,"running":%s,"listen_address":"%s","listen_port":"%s","listen":"%s:%s","upstream_timeout":"%s","http_client":"%s","log_file":"%s"}\n' \
+		"$(json_bool "$enabled")" \
+		"$(json_bool "$running")" \
+		"$(json_escape "$address")" \
+		"$(json_escape "$port")" \
+		"$(json_escape "$address")" \
+		"$(json_escape "$port")" \
+		"$(json_escape "$timeout")" \
+		"$(json_escape "$client")" \
+		"$(json_escape "$log_file")"
+}
+
+proxy_restart() {
+	if [ -x /etc/init.d/ccswitch-proxy ]; then
+		/etc/init.d/ccswitch-proxy enable >/dev/null 2>&1
+		/etc/init.d/ccswitch-proxy restart >/dev/null 2>&1
+		proxy_status
+	else
+		json_error "ccswitch-proxy 服务未安装"
+	fi
+}
+
+usage_json() {
+	local limit log_file first line count
+	limit="$1"
+	log_file="/etc/ccswitch/usage.jsonl"
+	[ -n "$limit" ] || limit=50
+	[ "$limit" -gt 0 ] 2>/dev/null || limit=50
+
+	count=0
+	[ -f "$log_file" ] && count="$(wc -l < "$log_file" 2>/dev/null | tr -d ' ')" || count=0
+
+	printf '{"ok":true,"log_file":"%s","total":%s,"entries":[' "$(json_escape "$log_file")" "$count"
+	first=1
+	if [ -f "$log_file" ]; then
+		tail -n "$limit" "$log_file" 2>/dev/null | while IFS= read -r line; do
+			case "$line" in
+				\{*\})
+					[ "$first" = "1" ] || printf ','
+					first=0
+					printf '%s' "$line"
+				;;
+			esac
+		done
+	fi
+	printf ']}\n'
+}
+
+case "$1" in
+	list)
+		printf '{'
+		printf '"status":{"app":""},'
+		printf '"backups":{"app":""},'
+		printf '"apply":{"app":"","section":""},'
+		printf '"restore":{"app":"","file":""},'
+		printf '"proxy_status":{},'
+		printf '"proxy_restart":{},'
+		printf '"usage":{"limit":0}'
+		printf '}\n'
+	;;
+	call)
+		read -r input
+		app="$(json_arg "$input" '@.app')"
+		section="$(json_arg "$input" '@.section')"
+		limit="$(json_arg "$input" '@.limit')"
+
+		case "$2" in
+			status|backups)
+				status_app "$app"
+			;;
+			apply)
+				case "$app" in
+					claude) apply_claude "$section" ;;
+					codex) apply_codex "$section" ;;
+					*) json_error "不支持的应用" ;;
+				esac
+			;;
+			restore)
+				restore_app "$app"
+			;;
+			proxy_status)
+				proxy_status
+			;;
+			proxy_restart)
+				proxy_restart
+			;;
+			usage)
+				usage_json "$limit"
+			;;
+			*)
+				json_error "不支持的方法"
+			;;
+		esac
+	;;
+esac

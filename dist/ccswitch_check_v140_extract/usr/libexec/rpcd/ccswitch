@@ -1,0 +1,665 @@
+#!/bin/sh
+
+CONFIG="ccswitch"
+DEFAULT_CLAUDE_DIR="/root/.claude"
+DEFAULT_CODEX_DIR="/root/.codex"
+DEFAULT_BACKUP_DIR="/etc/ccswitch/backups"
+DEFAULT_SECRET_DIR="/etc/ccswitch/secrets"
+DEFAULT_RETAIN="10"
+DEFAULT_USAGE_RETAIN="2000"
+USAGE_LOG="/etc/ccswitch/usage.jsonl"
+
+json_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+toml_escape() {
+	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+json_bool() {
+	[ "$1" = "1" ] && printf 'true' || printf 'false'
+}
+
+json_error() {
+	printf '{"ok":false,"error":"%s"}\n' "$(json_escape "$1")"
+}
+
+json_ok() {
+	printf '{"ok":true,"message":"%s"}\n' "$(json_escape "$1")"
+}
+
+json_arg() {
+	jsonfilter -s "$1" -e "$2" 2>/dev/null
+}
+
+global_get() {
+	local key="$1" default="$2" value
+	value="$(uci -q get "$CONFIG.global.$key")"
+	[ -n "$value" ] && printf '%s' "$value" || printf '%s' "$default"
+}
+
+section_get() {
+	local section="$1" key="$2"
+	uci -q get "$CONFIG.$section.$key"
+}
+
+validate_section() {
+	local section="$1" expected="$2" actual
+	case "$section" in
+		''|*[!A-Za-z0-9_]*)
+			json_error "Invalid provider section"
+			return 1
+		;;
+	esac
+
+	actual="$(uci -q get "$CONFIG.$section")"
+	if [ "$actual" != "$expected" ]; then
+		json_error "Provider section type mismatch"
+		return 1
+	fi
+	return 0
+}
+
+require_value() {
+	local value="$1" label="$2"
+	if [ -z "$value" ]; then
+		json_error "$label is required"
+		return 1
+	fi
+	return 0
+}
+
+valid_url() {
+	case "$1" in
+		http://*|https://*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+timestamp() {
+	date '+%Y%m%d-%H%M%S'
+}
+
+backup_dir() {
+	global_get backup_dir "$DEFAULT_BACKUP_DIR"
+}
+
+backup_retain() {
+	global_get backup_retain "$DEFAULT_RETAIN"
+}
+
+cleanup_backups() {
+	local dir="$1" retain="$2" item count
+	[ -d "$dir" ] || return 0
+	[ "$retain" -gt 0 ] 2>/dev/null || retain="$DEFAULT_RETAIN"
+
+	count=0
+	for item in $(ls -1t "$dir" 2>/dev/null); do
+		count=$((count + 1))
+		[ "$count" -le "$retain" ] && continue
+		rm -f "$dir/$item"
+	done
+}
+
+backup_file() {
+	local app="$1" path="$2" dir base stamp retain
+	[ -f "$path" ] || return 0
+
+	dir="$(backup_dir)/$app"
+	base="$(basename "$path")"
+	stamp="$(timestamp)"
+	retain="$(backup_retain)"
+
+	mkdir -p "$dir" || return 1
+	cp "$path" "$dir/$base.$stamp" || return 1
+	cleanup_backups "$dir" "$retain"
+}
+
+write_atomic() {
+	local path="$1" tmp
+	tmp="$path.tmp.$$"
+	mkdir -p "$(dirname "$path")" || return 1
+	umask 077
+	cat > "$tmp" || return 1
+	mv "$tmp" "$path" || {
+		rm -f "$tmp"
+		return 1
+	}
+	chmod 600 "$path" 2>/dev/null
+}
+
+secret_path() {
+	local section="$1"
+	printf '%s/%s.key' "$DEFAULT_SECRET_DIR" "$section"
+}
+
+secret_get() {
+	local section="$1" ref key
+	ref="$(section_get "$section" api_key_ref)"
+	if [ -n "$ref" ] && [ -f "$ref" ]; then
+		sed -n '1p' "$ref"
+		return 0
+	fi
+	key="$(section_get "$section" api_key)"
+	printf '%s' "$key"
+}
+
+secret_store_if_needed() {
+	local section="$1" key="$2" path
+	[ -n "$key" ] || return 0
+	[ "$key" = "********" ] && return 0
+	path="$(secret_path "$section")"
+	mkdir -p "$DEFAULT_SECRET_DIR" || return 1
+	chmod 700 "$DEFAULT_SECRET_DIR" 2>/dev/null
+	umask 077
+	printf '%s' "$key" > "$path" || return 1
+	chmod 600 "$path" 2>/dev/null
+	uci -q set "$CONFIG.$section.api_key_ref=$path"
+	uci -q delete "$CONFIG.$section.api_key"
+}
+
+has_secret() {
+	local section="$1" ref
+	ref="$(section_get "$section" api_key_ref)"
+	[ -n "$ref" ] && [ -f "$ref" ] && return 0
+	[ -n "$(section_get "$section" api_key)" ] && return 0
+	return 1
+}
+
+normalize_codex_base_url() {
+	local url
+	url="${1%/}"
+	case "$url" in
+		*/v1) printf '%s' "$url" ;;
+		http://*/*|https://*/*) printf '%s' "$url" ;;
+		*) printf '%s/v1' "$url" ;;
+	esac
+}
+
+proxy_cli_base_url() {
+	local address port
+	address="$(uci -q get "$CONFIG.proxy.listen_address")"
+	port="$(uci -q get "$CONFIG.proxy.listen_port")"
+	[ -n "$address" ] || address="127.0.0.1"
+	[ -n "$port" ] || port="15721"
+	case "$address" in
+		0.0.0.0|::|localhost) address="127.0.0.1" ;;
+	esac
+	printf 'http://%s:%s' "$address" "$port"
+}
+
+ensure_proxy_running() {
+	uci -q set "$CONFIG.proxy.enabled=1"
+	uci -q commit "$CONFIG"
+	if [ -x /etc/init.d/ccswitch-proxy ]; then
+		/etc/init.d/ccswitch-proxy enable >/dev/null 2>&1
+		/etc/init.d/ccswitch-proxy restart >/dev/null 2>&1
+	fi
+}
+
+apply_claude() {
+	local section="$1" name base_url live_base api_key new_api_key api_format api_key_field model haiku_model sonnet_model opus_model hide_ai_signature teammates_mode enable_tool_search max_thinking_enabled disable_auto_update dir path route_mode live_key
+
+	validate_section "$section" "claude_provider" || return 0
+
+	name="$(section_get "$section" name)"
+	base_url="$(section_get "$section" base_url)"
+	new_api_key="$(section_get "$section" api_key)"
+	secret_store_if_needed "$section" "$new_api_key" || {
+		json_error "Failed to save API key secret"
+		return 0
+	}
+	api_key="$(secret_get "$section")"
+	api_format="$(section_get "$section" api_format)"
+	api_key_field="$(section_get "$section" api_key_field)"
+	model="$(section_get "$section" model)"
+	haiku_model="$(section_get "$section" haiku_model)"
+	sonnet_model="$(section_get "$section" sonnet_model)"
+	opus_model="$(section_get "$section" opus_model)"
+	hide_ai_signature="$(section_get "$section" hide_ai_signature)"
+	teammates_mode="$(section_get "$section" teammates_mode)"
+	enable_tool_search="$(section_get "$section" enable_tool_search)"
+	max_thinking_enabled="$(section_get "$section" max_thinking_enabled)"
+	disable_auto_update="$(section_get "$section" disable_auto_update)"
+	route_mode="$(global_get claude_route_mode direct)"
+	[ -n "$api_format" ] || api_format="anthropic"
+	[ -n "$api_key_field" ] || api_key_field="ANTHROPIC_AUTH_TOKEN"
+	[ -n "$haiku_model" ] || haiku_model="$model"
+	[ -n "$sonnet_model" ] || sonnet_model="$model"
+	[ -n "$opus_model" ] || opus_model="$model"
+
+	require_value "$name" "Name" || return 0
+	require_value "$base_url" "Base URL" || return 0
+	require_value "$api_key" "API Key" || return 0
+	require_value "$model" "Model" || return 0
+
+	valid_url "$base_url" || {
+		json_error "Base URL must start with http:// or https://"
+		return 0
+	}
+
+	case "$api_key_field" in
+		ANTHROPIC_AUTH_TOKEN|ANTHROPIC_API_KEY) ;;
+		*) json_error "Unsupported Claude API key field"; return 0 ;;
+	esac
+
+	case "$api_format" in
+		anthropic) ;;
+		openai_chat|openai_responses)
+			json_error "Claude routing currently requires an Anthropic-compatible provider endpoint"
+			return 0
+		;;
+		*) json_error "Unsupported Claude API format"; return 0 ;;
+	esac
+
+	live_base="$base_url"
+	live_key="$api_key"
+	if [ "$route_mode" = "proxy" ]; then
+		live_base="$(proxy_cli_base_url)"
+		live_key="ccswitch-proxy"
+	fi
+
+	dir="$(global_get claude_config_dir "$DEFAULT_CLAUDE_DIR")"
+	path="$dir/settings.json"
+	backup_file claude "$path" || {
+		json_error "Failed to create Claude backup"
+		return 0
+	}
+
+	{
+		printf '{\n'
+		printf '  "env": {\n'
+		printf '    "ANTHROPIC_BASE_URL": "%s",\n' "$(json_escape "$live_base")"
+		printf '    "%s": "%s",\n' "$api_key_field" "$(json_escape "$live_key")"
+		printf '    "ANTHROPIC_MODEL": "%s",\n' "$(json_escape "$model")"
+		printf '    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "%s",\n' "$(json_escape "$haiku_model")"
+		printf '    "ANTHROPIC_DEFAULT_SONNET_MODEL": "%s",\n' "$(json_escape "$sonnet_model")"
+		printf '    "ANTHROPIC_DEFAULT_OPUS_MODEL": "%s"' "$(json_escape "$opus_model")"
+		[ "$max_thinking_enabled" = "1" ] && printf ',\n    "MAX_THINKING_TOKENS": "32000"'
+		printf '\n'
+		printf '  }'
+		[ "$hide_ai_signature" = "1" ] && printf ',\n  "includeCoAuthoredBy": false'
+		[ "$teammates_mode" = "1" ] && printf ',\n  "forceLoginMethod": "console"'
+		[ "$enable_tool_search" = "1" ] && printf ',\n  "enableToolSearch": true'
+		[ "$disable_auto_update" = "1" ] && printf ',\n  "disableAutoUpdate": true'
+		printf '\n'
+		printf '}\n'
+	} | write_atomic "$path" || {
+		json_error "Failed to write Claude settings.json"
+		return 0
+	}
+
+	uci -q set "$CONFIG.global.current_claude=$section"
+	uci -q set "$CONFIG.$section.enabled=1"
+	uci -q delete "$CONFIG.$section.api_key"
+	uci -q commit "$CONFIG"
+	[ "$route_mode" = "proxy" ] && ensure_proxy_running
+	logger -t ccswitch "Claude provider '$name' applied to $path route_mode=$route_mode"
+	json_ok "Claude provider applied"
+}
+
+apply_codex() {
+	local section="$1" name base_url api_key new_api_key model wire_api dir auth_path config_path codex_base_url route_mode live_key
+
+	validate_section "$section" "codex_provider" || return 0
+
+	name="$(section_get "$section" name)"
+	base_url="$(section_get "$section" base_url)"
+	new_api_key="$(section_get "$section" api_key)"
+	secret_store_if_needed "$section" "$new_api_key" || {
+		json_error "Failed to save API key secret"
+		return 0
+	}
+	api_key="$(secret_get "$section")"
+	model="$(section_get "$section" model)"
+	wire_api="$(section_get "$section" wire_api)"
+	route_mode="$(global_get codex_route_mode direct)"
+	[ -n "$wire_api" ] || wire_api="responses"
+
+	require_value "$name" "Name" || return 0
+	require_value "$base_url" "Base URL" || return 0
+	require_value "$api_key" "API Key" || return 0
+	require_value "$model" "Model" || return 0
+
+	valid_url "$base_url" || {
+		json_error "Base URL must start with http:// or https://"
+		return 0
+	}
+
+	case "$wire_api" in
+		responses|chat) ;;
+		*) json_error "Unsupported Codex wire API"; return 0 ;;
+	esac
+
+	codex_base_url="$(normalize_codex_base_url "$base_url")"
+	live_key="$api_key"
+	if [ "$route_mode" = "proxy" ]; then
+		codex_base_url="$(normalize_codex_base_url "$(proxy_cli_base_url)")"
+		live_key="ccswitch-proxy"
+	fi
+
+	dir="$(global_get codex_config_dir "$DEFAULT_CODEX_DIR")"
+	auth_path="$dir/auth.json"
+	config_path="$dir/config.toml"
+	backup_file codex "$auth_path" || {
+		json_error "Failed to create Codex auth backup"
+		return 0
+	}
+	backup_file codex "$config_path" || {
+		json_error "Failed to create Codex config backup"
+		return 0
+	}
+
+	{
+		printf '{\n'
+		printf '  "OPENAI_API_KEY": "%s"\n' "$(json_escape "$live_key")"
+		printf '}\n'
+	} | write_atomic "$auth_path" || {
+		json_error "Failed to write Codex auth.json"
+		return 0
+	}
+
+	{
+		printf 'model_provider = "ccswitch"\n'
+		printf 'model = "%s"\n\n' "$(toml_escape "$model")"
+		printf '[model_providers.ccswitch]\n'
+		printf 'name = "CC Switch"\n'
+		printf 'base_url = "%s"\n' "$(toml_escape "$codex_base_url")"
+		printf 'wire_api = "%s"\n' "$(toml_escape "$wire_api")"
+		printf 'requires_openai_auth = true\n'
+	} | write_atomic "$config_path" || {
+		json_error "Failed to write Codex config.toml"
+		return 0
+	}
+
+	uci -q set "$CONFIG.global.current_codex=$section"
+	uci -q set "$CONFIG.$section.enabled=1"
+	uci -q delete "$CONFIG.$section.api_key"
+	uci -q commit "$CONFIG"
+	[ "$route_mode" = "proxy" ] && ensure_proxy_running
+	logger -t ccswitch "Codex provider '$name' applied to $dir route_mode=$route_mode"
+	json_ok "Codex provider applied"
+}
+
+list_backups_json() {
+	local app="$1" dir item first path
+	dir="$(backup_dir)/$app"
+	first=1
+	printf '['
+	if [ -d "$dir" ]; then
+		for item in $(ls -1t "$dir" 2>/dev/null | head -n 20); do
+			path="$dir/$item"
+			[ "$first" = "1" ] || printf ','
+			first=0
+			printf '"%s"' "$(json_escape "$path")"
+		done
+	fi
+	printf ']'
+}
+
+status_app() {
+	local app="$1" current current_name claude_dir codex_dir backup exists1 exists2 route_mode
+	backup="$(backup_dir)"
+
+	case "$app" in
+		claude)
+			current="$(global_get current_claude "")"
+			current_name="$(section_get "$current" name)"
+			route_mode="$(global_get claude_route_mode direct)"
+			claude_dir="$(global_get claude_config_dir "$DEFAULT_CLAUDE_DIR")"
+			[ -f "$claude_dir/settings.json" ] && exists1=1 || exists1=0
+			printf '{"ok":true,"app":"claude","current":"%s","current_name":"%s","route_mode":"%s","has_key":%s,"paths":["%s"],"exists":[%s],"backup_dir":"%s","backups":' \
+				"$(json_escape "$current")" \
+				"$(json_escape "$current_name")" \
+				"$(json_escape "$route_mode")" \
+				"$(has_secret "$current" && printf true || printf false)" \
+				"$(json_escape "$claude_dir/settings.json")" \
+				"$(json_bool "$exists1")" \
+				"$(json_escape "$backup/claude")"
+			list_backups_json claude
+			printf '}\n'
+		;;
+		codex)
+			current="$(global_get current_codex "")"
+			current_name="$(section_get "$current" name)"
+			route_mode="$(global_get codex_route_mode direct)"
+			codex_dir="$(global_get codex_config_dir "$DEFAULT_CODEX_DIR")"
+			[ -f "$codex_dir/auth.json" ] && exists1=1 || exists1=0
+			[ -f "$codex_dir/config.toml" ] && exists2=1 || exists2=0
+			printf '{"ok":true,"app":"codex","current":"%s","current_name":"%s","route_mode":"%s","has_key":%s,"paths":["%s","%s"],"exists":[%s,%s],"backup_dir":"%s","backups":' \
+				"$(json_escape "$current")" \
+				"$(json_escape "$current_name")" \
+				"$(json_escape "$route_mode")" \
+				"$(has_secret "$current" && printf true || printf false)" \
+				"$(json_escape "$codex_dir/auth.json")" \
+				"$(json_escape "$codex_dir/config.toml")" \
+				"$(json_bool "$exists1")" \
+				"$(json_bool "$exists2")" \
+				"$(json_escape "$backup/codex")"
+			list_backups_json codex
+			printf '}\n'
+		;;
+		*) json_error "Unsupported app" ;;
+	esac
+}
+
+restore_latest_claude() {
+	local dir target latest
+	dir="$(backup_dir)/claude"
+	target="$(global_get claude_config_dir "$DEFAULT_CLAUDE_DIR")/settings.json"
+	latest="$(ls -1t "$dir"/settings.json.* 2>/dev/null | head -n 1)"
+	[ -n "$latest" ] || { json_error "No Claude backup found"; return 0; }
+	backup_file claude "$target" >/dev/null 2>&1
+	mkdir -p "$(dirname "$target")" || { json_error "Failed to create Claude config directory"; return 0; }
+	cp "$latest" "$target" && chmod 600 "$target" 2>/dev/null || { json_error "Failed to restore Claude backup"; return 0; }
+	logger -t ccswitch "Claude backup restored from $latest"
+	json_ok "Claude backup restored"
+}
+
+restore_latest_codex() {
+	local dir codex_dir latest base stamp auth_backup config_backup
+	dir="$(backup_dir)/codex"
+	codex_dir="$(global_get codex_config_dir "$DEFAULT_CODEX_DIR")"
+	latest="$(ls -1t "$dir"/config.toml.* "$dir"/auth.json.* 2>/dev/null | head -n 1)"
+	[ -n "$latest" ] || { json_error "No Codex backup found"; return 0; }
+
+	base="$(basename "$latest")"
+	case "$base" in
+		config.toml.*) stamp="${base#config.toml.}" ;;
+		auth.json.*) stamp="${base#auth.json.}" ;;
+		*) stamp="" ;;
+	esac
+	[ -n "$stamp" ] || { json_error "Invalid Codex backup name"; return 0; }
+
+	auth_backup="$dir/auth.json.$stamp"
+	config_backup="$dir/config.toml.$stamp"
+	mkdir -p "$codex_dir" || { json_error "Failed to create Codex config directory"; return 0; }
+	backup_file codex "$codex_dir/auth.json" >/dev/null 2>&1
+	backup_file codex "$codex_dir/config.toml" >/dev/null 2>&1
+	[ -f "$auth_backup" ] && cp "$auth_backup" "$codex_dir/auth.json"
+	[ -f "$config_backup" ] && cp "$config_backup" "$codex_dir/config.toml"
+	chmod 600 "$codex_dir/auth.json" "$codex_dir/config.toml" 2>/dev/null
+	logger -t ccswitch "Codex backup restored from stamp $stamp"
+	json_ok "Codex backup restored"
+}
+
+restore_app() {
+	case "$1" in
+		claude) restore_latest_claude ;;
+		codex) restore_latest_codex ;;
+		*) json_error "Unsupported app" ;;
+	esac
+}
+
+usage_count_matching() {
+	local pattern="$1" count
+	[ -f "$USAGE_LOG" ] || { printf 0; return; }
+	count="$(grep -c "$pattern" "$USAGE_LOG" 2>/dev/null)"
+	[ -n "$count" ] || count=0
+	printf '%s' "$count"
+}
+
+proxy_status() {
+	local enabled address port timeout usage_retain running client count errors log_file
+	enabled="$(uci -q get "$CONFIG.proxy.enabled")"
+	address="$(uci -q get "$CONFIG.proxy.listen_address")"
+	port="$(uci -q get "$CONFIG.proxy.listen_port")"
+	timeout="$(uci -q get "$CONFIG.proxy.upstream_timeout")"
+	usage_retain="$(uci -q get "$CONFIG.proxy.usage_retain")"
+	log_file="$USAGE_LOG"
+	[ -n "$enabled" ] || enabled=0
+	[ -n "$address" ] || address="127.0.0.1"
+	[ -n "$port" ] || port="15721"
+	[ -n "$timeout" ] || timeout="600"
+	[ -n "$usage_retain" ] || usage_retain="$DEFAULT_USAGE_RETAIN"
+	[ -f "$USAGE_LOG" ] && count="$(wc -l < "$USAGE_LOG" 2>/dev/null | tr -d ' ')" || count=0
+	errors="$(usage_count_matching '"status":[45]')"
+
+	if /etc/init.d/ccswitch-proxy running >/dev/null 2>&1; then running=1; else running=0; fi
+	if command -v curl >/dev/null 2>&1; then client="curl"; else client=""; fi
+
+	printf '{"ok":true,"enabled":%s,"running":%s,"listen_address":"%s","listen_port":"%s","listen":"%s:%s","upstream_timeout":"%s","usage_retain":"%s","http_client":"%s","log_file":"%s","log_count":%s,"error_count":%s}\n' \
+		"$(json_bool "$enabled")" \
+		"$(json_bool "$running")" \
+		"$(json_escape "$address")" \
+		"$(json_escape "$port")" \
+		"$(json_escape "$address")" \
+		"$(json_escape "$port")" \
+		"$(json_escape "$timeout")" \
+		"$(json_escape "$usage_retain")" \
+		"$(json_escape "$client")" \
+		"$(json_escape "$log_file")" \
+		"$count" \
+		"$errors"
+}
+
+proxy_restart() {
+	if [ -x /etc/init.d/ccswitch-proxy ]; then
+		/etc/init.d/ccswitch-proxy enable >/dev/null 2>&1
+		/etc/init.d/ccswitch-proxy restart >/dev/null 2>&1
+		proxy_status
+	else
+		json_error "ccswitch-proxy service is not installed"
+	fi
+}
+
+usage_entries_json() {
+	local limit="$1" errors_only="$2" first line
+	[ -n "$limit" ] || limit=100
+	[ "$limit" -gt 0 ] 2>/dev/null || limit=100
+	first=1
+	printf '['
+	if [ -f "$USAGE_LOG" ]; then
+		if [ "$errors_only" = "1" ]; then
+			grep '"status":[45]' "$USAGE_LOG" 2>/dev/null | tail -n "$limit" | while IFS= read -r line; do
+				case "$line" in
+					\{*\})
+						[ "$first" = "1" ] || printf ','
+						first=0
+						printf '%s' "$line"
+					;;
+				esac
+			done
+		else
+			tail -n "$limit" "$USAGE_LOG" 2>/dev/null | while IFS= read -r line; do
+				case "$line" in
+					\{*\})
+						[ "$first" = "1" ] || printf ','
+						first=0
+						printf '%s' "$line"
+					;;
+				esac
+			done
+		fi
+	fi
+	printf ']'
+}
+
+usage_json() {
+	local limit="$1" count errors
+	[ -f "$USAGE_LOG" ] && count="$(wc -l < "$USAGE_LOG" 2>/dev/null | tr -d ' ')" || count=0
+	errors="$(usage_count_matching '"status":[45]')"
+	printf '{"ok":true,"log_file":"%s","total":%s,"errors":%s,"entries":' "$(json_escape "$USAGE_LOG")" "$count" "$errors"
+	usage_entries_json "$limit" 0
+	printf ',"recent_errors":'
+	usage_entries_json 30 1
+	printf '}\n'
+}
+
+usage_clear() {
+	mkdir -p "$(dirname "$USAGE_LOG")"
+	: > "$USAGE_LOG"
+	chmod 600 "$USAGE_LOG" 2>/dev/null
+	json_ok "Usage log cleared"
+}
+
+usage_trim() {
+	local limit="$1" tmp
+	[ -n "$limit" ] || limit="$(uci -q get "$CONFIG.proxy.usage_retain")"
+	[ -n "$limit" ] || limit="$DEFAULT_USAGE_RETAIN"
+	[ "$limit" -gt 0 ] 2>/dev/null || limit="$DEFAULT_USAGE_RETAIN"
+	[ -f "$USAGE_LOG" ] || { json_ok "Usage log trimmed"; return 0; }
+	tmp="$USAGE_LOG.tmp.$$"
+	tail -n "$limit" "$USAGE_LOG" > "$tmp" && mv "$tmp" "$USAGE_LOG"
+	chmod 600 "$USAGE_LOG" 2>/dev/null
+	json_ok "Usage log trimmed"
+}
+
+usage_export() {
+	local limit="$1" first line
+	[ -n "$limit" ] || limit=5000
+	[ "$limit" -gt 0 ] 2>/dev/null || limit=5000
+	printf '{"ok":true,"filename":"ccswitch-usage.jsonl","content":"'
+	if [ -f "$USAGE_LOG" ]; then
+		first=1
+		tail -n "$limit" "$USAGE_LOG" 2>/dev/null | while IFS= read -r line; do
+			[ "$first" = "1" ] || printf '\\n'
+			first=0
+			printf '%s' "$(json_escape "$line")"
+		done
+	fi
+	printf '"}\n'
+}
+
+case "$1" in
+	list)
+		printf '{'
+		printf '"status":{"app":""},'
+		printf '"backups":{"app":""},'
+		printf '"apply":{"app":"","section":""},'
+		printf '"restore":{"app":"","file":""},'
+		printf '"proxy_status":{},'
+		printf '"proxy_restart":{},'
+		printf '"usage":{"limit":0},'
+		printf '"usage_clear":{},'
+		printf '"usage_trim":{"limit":0},'
+		printf '"usage_export":{"limit":0}'
+		printf '}\n'
+	;;
+	call)
+		read -r input
+		app="$(json_arg "$input" '@.app')"
+		section="$(json_arg "$input" '@.section')"
+		limit="$(json_arg "$input" '@.limit')"
+
+		case "$2" in
+			status|backups) status_app "$app" ;;
+			apply)
+				case "$app" in
+					claude) apply_claude "$section" ;;
+					codex) apply_codex "$section" ;;
+					*) json_error "Unsupported app" ;;
+				esac
+			;;
+			restore) restore_app "$app" ;;
+			proxy_status) proxy_status ;;
+			proxy_restart) proxy_restart ;;
+			usage) usage_json "$limit" ;;
+			usage_clear) usage_clear ;;
+			usage_trim) usage_trim "$limit" ;;
+			usage_export) usage_export "$limit" ;;
+			*) json_error "Unsupported method" ;;
+		esac
+	;;
+esac

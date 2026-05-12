@@ -1,0 +1,47 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=92
+STOP=15
+
+CONFIG="ccswitch"
+PROG="/usr/sbin/uhttpd"
+DOCROOT="/usr/share/ccswitch/proxy-www"
+
+start_service() {
+	local enabled listen_address listen_port timeout
+
+	config_load "$CONFIG"
+	config_get_bool enabled proxy enabled 0
+	[ "$enabled" = "1" ] || return 0
+
+	config_get listen_address proxy listen_address "127.0.0.1"
+	config_get listen_port proxy listen_port "15721"
+	config_get timeout proxy upstream_timeout "600"
+
+	[ -x "$PROG" ] || {
+		logger -t ccswitch-proxy "uhttpd is not available"
+		return 1
+	}
+
+	[ -d "$DOCROOT" ] || {
+		logger -t ccswitch-proxy "proxy document root is missing"
+		return 1
+	}
+
+	procd_open_instance
+	procd_set_param command "$PROG" -f -h "$DOCROOT" -x "/" -t "$timeout" -T "$timeout" -n 20 -N 100 -D -p "$listen_address:$listen_port"
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$CONFIG"
+}

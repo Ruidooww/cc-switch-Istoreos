@@ -1,0 +1,5 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+chmod 755 /usr/libexec/rpcd/ccswitch 2>/dev/null
+[ -x /etc/uci-defaults/90_luci-ccswitch ] && /etc/uci-defaults/90_luci-ccswitch
+exit 0

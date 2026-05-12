@@ -1,0 +1,264 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+
+msgid "CC Switch - Claude Code"
+msgstr "CC Switch - Claude Code"
+
+msgid "CC Switch - Codex"
+msgstr "CC Switch - Codex"
+
+msgid "Manage Claude Code API providers and write the active provider to the root user configuration."
+msgstr "管理 Claude Code API 供应商，并将当前供应商写入 root 用户配置。"
+
+msgid "Manage Codex CLI API providers and write the active provider to the root user configuration."
+msgstr "管理 Codex CLI API 供应商，并将当前供应商写入 root 用户配置。"
+
+msgid "Current provider"
+msgstr "当前供应商"
+
+msgid "Live config path"
+msgstr "实时配置路径"
+
+msgid "Live config paths"
+msgstr "实时配置路径"
+
+msgid "Backup directory"
+msgstr "备份目录"
+
+msgid "Recent backups"
+msgstr "最近备份"
+
+msgid "No backups yet"
+msgstr "暂无备份"
+
+msgid "Restore latest backup"
+msgstr "恢复最近备份"
+
+msgid "Global settings"
+msgstr "全局设置"
+
+msgid "Claude config directory"
+msgstr "Claude 配置目录"
+
+msgid "Codex config directory"
+msgstr "Codex 配置目录"
+
+msgid "Backup root directory"
+msgstr "备份根目录"
+
+msgid "Backup retain count"
+msgstr "备份保留数量"
+
+msgid "Claude Code providers"
+msgstr "Claude Code 供应商"
+
+msgid "Codex providers"
+msgstr "Codex 供应商"
+
+msgid "Add provider"
+msgstr "新增供应商"
+
+msgid "Edit provider"
+msgstr "编辑供应商"
+
+msgid "Template"
+msgstr "模板"
+
+msgid "Provider"
+msgstr "模型商"
+
+msgid "Anthropic Compatible"
+msgstr "Anthropic 兼容"
+
+msgid "OpenAI Compatible"
+msgstr "OpenAI 兼容"
+
+msgid "NewAPI / Anthropic proxy"
+msgstr "NewAPI / Anthropic 代理"
+
+msgid "Claude proxy compatible"
+msgstr "Claude 代理兼容"
+
+msgid "DeepSeek Anthropic endpoint"
+msgstr "DeepSeek Anthropic 端点"
+
+msgid "Website URL"
+msgstr "官网链接"
+
+msgid "Full URL"
+msgstr "完整 URL"
+
+msgid "Treat Base URL as the complete Claude API service address and do not append suffixes."
+msgstr "将 Base URL 视为完整 Claude API 服务地址，不自动追加后缀。"
+
+msgid "OpenRouter"
+msgstr "OpenRouter"
+
+msgid "DeepSeek"
+msgstr "DeepSeek"
+
+msgid "SiliconFlow"
+msgstr "硅基流动"
+
+msgid "Moonshot Kimi"
+msgstr "Moonshot Kimi"
+
+msgid "Qwen DashScope"
+msgstr "通义千问 DashScope"
+
+msgid "Zhipu GLM"
+msgstr "智谱 GLM"
+
+msgid "Volcengine Ark"
+msgstr "火山方舟"
+
+msgid "Custom"
+msgstr "自定义"
+
+msgid "Base URL"
+msgstr "Base URL"
+
+msgid "API Key"
+msgstr "API Key"
+
+msgid "API key field"
+msgstr "API Key 字段"
+
+msgid "API format"
+msgstr "API 格式"
+
+msgid "Anthropic Messages (native)"
+msgstr "Anthropic Messages（原生）"
+
+msgid "OpenAI Chat (proxy required)"
+msgstr "OpenAI Chat（需要代理）"
+
+msgid "OpenAI Responses (proxy required)"
+msgstr "OpenAI Responses（需要代理）"
+
+msgid "Model"
+msgstr "模型"
+
+msgid "Haiku default model"
+msgstr "Haiku 默认模型"
+
+msgid "Sonnet default model"
+msgstr "Sonnet 默认模型"
+
+msgid "Opus default model"
+msgstr "Opus 默认模型"
+
+msgid "Hide AI signature"
+msgstr "隐藏 AI 署名"
+
+msgid "Teammates mode"
+msgstr "Teammates 模式"
+
+msgid "Enable Tool Search"
+msgstr "启用 Tool Search"
+
+msgid "Max thinking"
+msgstr "最大强度思考"
+
+msgid "Disable auto update"
+msgstr "禁用自动升级"
+
+msgid "Config JSON preview"
+msgstr "配置 JSON 预览"
+
+msgid "Wire API"
+msgstr "接口类型"
+
+msgid "Responses"
+msgstr "Responses"
+
+msgid "Chat Completions"
+msgstr "Chat Completions"
+
+msgid "Notes"
+msgstr "备注"
+
+msgid "CC Switch - Routing"
+msgstr "CC Switch - 路由"
+
+msgid "CC Switch - Usage"
+msgstr "CC Switch - 使用统计"
+
+msgid "Routing requires a local proxy daemon. This LuCI package currently provides direct configuration switching only."
+msgstr "路由需要本地代理服务。当前 LuCI 包只提供直接配置切换。"
+
+msgid "Configure the local proxy listen address for the future routing daemon. The current package still performs direct configuration switching."
+msgstr "配置未来路由代理服务的本地监听地址。当前包仍然执行直接配置切换。"
+
+msgid "Proxy settings"
+msgstr "代理设置"
+
+msgid "Enable proxy routing"
+msgstr "启用代理路由"
+
+msgid "This stores the desired state only. The proxy daemon will be added in a later package."
+msgstr "这里只保存期望状态。代理服务会在后续包中加入。"
+
+msgid "Listen address"
+msgstr "监听地址"
+
+msgid "Listen address is required"
+msgstr "监听地址不能为空"
+
+msgid "Use an IPv4/IPv6 address, localhost, 0.0.0.0 or ::"
+msgstr "请使用 IPv4/IPv6 地址、localhost、0.0.0.0 或 ::"
+
+msgid "Listen port"
+msgstr "监听端口"
+
+msgid "Log requests"
+msgstr "记录请求"
+
+msgid "When the proxy daemon is available, request logs will feed the Usage page."
+msgstr "代理服务可用后，请求日志会进入用量页面。"
+
+msgid "Upstream timeout"
+msgstr "上游超时"
+
+msgid "Seconds to wait for upstream provider responses."
+msgstr "等待上游供应商响应的秒数。"
+
+msgid "Proxy daemon"
+msgstr "代理服务"
+
+msgid "Not installed in this package"
+msgstr "当前包未安装"
+
+msgid "Configured listen address"
+msgstr "已配置监听地址"
+
+msgid "The next package can read these settings to start the routing daemon."
+msgstr "后续包可以读取这些设置来启动路由代理服务。"
+
+msgid "Usage statistics require requests to pass through the local proxy daemon first."
+msgstr "使用统计需要请求先经过本地代理服务。"
+
+msgid "Action"
+msgstr "操作"
+
+msgid "Enable"
+msgstr "启用"
+
+msgid "Save and enable"
+msgstr "保存并启用"
+
+msgid "Provider applied"
+msgstr "供应商已启用"
+
+msgid "Backup restored"
+msgstr "备份已恢复"
+
+msgid "Failed to apply provider"
+msgstr "启用供应商失败"
+
+msgid "Failed to restore backup"
+msgstr "恢复备份失败"
+
+msgid "Base URL must start with http:// or https://"
+msgstr "Base URL 必须以 http:// 或 https:// 开头"
