@@ -10,11 +10,74 @@ DEFAULT_USAGE_RETAIN="2000"
 USAGE_LOG="/etc/ccswitch/usage.jsonl"
 
 json_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+	printf '%s' "$1" | awk 'BEGIN { ORS = ""; first = 1 } {
+		gsub(/\\/,"\\\\")
+		gsub(/"/,"\\\"")
+		gsub(/\r/,"\\r")
+		gsub(/\t/,"\\t")
+		if (!first) printf "\\n"
+		printf "%s", $0
+		first = 0
+	}'
 }
 
 toml_escape() {
 	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+curl_config_escape() {
+	printf '%s' "$1" | awk 'BEGIN { ORS = "" } { gsub(/[[:cntrl:]]/,""); printf "%s", $0 }' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+make_tmp_dir() {
+	local prefix="$1" dir
+	[ -n "$prefix" ] || prefix="ccswitch"
+	dir="$(mktemp -d "/tmp/$prefix.XXXXXX" 2>/dev/null)" && {
+		printf '%s' "$dir"
+		return 0
+	}
+	dir="/tmp/$prefix.$$.$(date +%s)"
+	mkdir -p "$dir" 2>/dev/null && {
+		printf '%s' "$dir"
+		return 0
+	}
+	return 1
+}
+
+write_test_curl_config() {
+	local file="$1" url="$2" timeout="$3" headers="$4" body="$5" request="$6" app="$7" api_key="$8" key_field="$9" version beta
+	shift 9
+	version="$1"
+	beta="$2"
+
+	umask 077
+	{
+		printf 'url = "%s"\n' "$(curl_config_escape "$url")"
+		printf 'request = "POST"\n'
+		printf 'connect-timeout = 15\n'
+		printf 'max-time = %s\n' "$timeout"
+		printf 'silent\n'
+		printf 'show-error\n'
+		printf 'dump-header = "%s"\n' "$(curl_config_escape "$headers")"
+		printf 'output = "%s"\n' "$(curl_config_escape "$body")"
+		printf 'header = "Content-Type: application/json"\n'
+		case "$app" in
+			claude)
+				if [ "$key_field" = "ANTHROPIC_API_KEY" ]; then
+					printf 'header = "x-api-key: %s"\n' "$(curl_config_escape "$api_key")"
+				else
+					printf 'header = "Authorization: Bearer %s"\n' "$(curl_config_escape "$api_key")"
+				fi
+				printf 'header = "anthropic-version: %s"\n' "$(curl_config_escape "$version")"
+				[ -n "$beta" ] && printf 'header = "anthropic-beta: %s"\n' "$(curl_config_escape "$beta")"
+			;;
+			codex)
+				printf 'header = "Authorization: Bearer %s"\n' "$(curl_config_escape "$api_key")"
+			;;
+		esac
+		printf 'data-binary = "@%s"\n' "$(curl_config_escape "$request")"
+	} > "$file"
+	chmod 600 "$file" 2>/dev/null
 }
 
 json_bool() {
@@ -30,13 +93,21 @@ json_ok() {
 }
 
 json_stream_escape() {
-	sed 's/\\/\\\\/g; s/"/\\"/g; s/$/\\n/' | tr -d '\n'
+	awk 'BEGIN { ORS = ""; first = 1 } {
+		gsub(/\\/,"\\\\")
+		gsub(/"/,"\\\"")
+		gsub(/\r/,"\\r")
+		gsub(/\t/,"\\t")
+		if (!first) printf "\\n"
+		printf "%s", $0
+		first = 0
+	}'
 }
 
 json_file_excerpt() {
 	local file="$1" limit="${2:-1200}"
 	[ -f "$file" ] || return 0
-	head -c "$limit" "$file" 2>/dev/null | tr '\r\n' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+	head -c "$limit" "$file" 2>/dev/null | tr '\r\n\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 mask_secrets() {
@@ -92,10 +163,19 @@ require_value() {
 }
 
 valid_url() {
-	case "$1" in
-		http://*|https://*) return 0 ;;
+	local url="$1" sanitized
+	case "$url" in
+		http://?*|https://?*) ;;
 		*) return 1 ;;
 	esac
+
+	sanitized="$(printf '%s' "$url" | awk 'BEGIN { ORS = "" } { gsub(/[[:cntrl:][:space:]]/,""); printf "%s", $0 }')"
+	[ "$url" = "$sanitized" ] || return 1
+
+	case "$url" in
+		*\"*|*\'*|*\<*|*\>*) return 1 ;;
+	esac
+	return 0
 }
 
 timestamp() {
@@ -139,8 +219,8 @@ backup_file() {
 
 write_atomic() {
 	local path="$1" tmp
-	tmp="$path.tmp.$$"
 	mkdir -p "$(dirname "$path")" || return 1
+	tmp="$(mktemp "$path.tmp.XXXXXX" 2>/dev/null)" || tmp="$path.tmp.$$"
 	umask 077
 	cat > "$tmp" || return 1
 	mv "$tmp" "$path" || {
@@ -167,9 +247,12 @@ secret_get() {
 }
 
 secret_store_if_needed() {
-	local section="$1" key="$2" path
+	local section="$1" key="$2" path ref
 	[ -n "$key" ] || return 0
-	[ "$key" = "********" ] && return 0
+	if [ "$key" = "********" ]; then
+		ref="$(section_get "$section" api_key_ref)"
+		[ -n "$ref" ] && [ -f "$ref" ] && return 0
+	fi
 	path="$(secret_path "$section")"
 	mkdir -p "$DEFAULT_SECRET_DIR" || return 1
 	chmod 700 "$DEFAULT_SECRET_DIR" 2>/dev/null
@@ -238,7 +321,7 @@ ensure_proxy_running() {
 	uci -q commit "$CONFIG"
 	if [ -x /etc/init.d/ccswitch-proxy ]; then
 		/etc/init.d/ccswitch-proxy enable >/dev/null 2>&1
-		/etc/init.d/ccswitch-proxy restart >/dev/null 2>&1
+		/etc/init.d/ccswitch-proxy running >/dev/null 2>&1 || /etc/init.d/ccswitch-proxy start >/dev/null 2>&1
 	fi
 }
 
@@ -614,7 +697,7 @@ failover_provider() {
 }
 
 test_provider() {
-	local app="$1" section="$2" type name base_url api_key new_api_key model api_key_field api_format wire_api is_full_url timeout path url headers body request status kind hint rc
+	local app="$1" section="$2" type name base_url api_key new_api_key model api_key_field api_format wire_api is_full_url timeout path url headers body request status kind hint rc tmpdir conf
 
 	type="$(provider_type_for_app "$app")"
 	[ -n "$type" ] || { json_error "Unsupported app"; return 0; }
@@ -641,9 +724,14 @@ test_provider() {
 	require_value "$model" "Model" || return 0
 	valid_url "$base_url" || { json_error "Base URL must start with http:// or https://"; return 0; }
 
-	headers="/tmp/ccswitch-test.$$.headers"
-	body="/tmp/ccswitch-test.$$.body"
-	request="/tmp/ccswitch-test.$$.json"
+	tmpdir="$(make_tmp_dir ccswitch-test)" || {
+		json_error "Failed to create temporary directory"
+		return 0
+	}
+	headers="$tmpdir/headers"
+	body="$tmpdir/body"
+	request="$tmpdir/request.json"
+	conf="$tmpdir/curl.conf"
 
 	case "$app" in
 		claude)
@@ -652,23 +740,16 @@ test_provider() {
 			is_full_url="$(section_get "$section" is_full_url)"
 			[ -n "$api_key_field" ] || api_key_field="ANTHROPIC_AUTH_TOKEN"
 			[ -n "$api_format" ] || api_format="anthropic"
-			[ "$api_format" = "anthropic" ] || { json_error "Claude provider test currently supports Anthropic-compatible endpoints"; return 0; }
+			[ "$api_format" = "anthropic" ] || {
+				rm -rf "$tmpdir"
+				json_error "Claude provider test currently supports Anthropic-compatible endpoints"
+				return 0
+			}
 			path="/v1/messages"
 			url="$(join_url "$base_url" "$path" "$is_full_url")"
 			printf '{"model":"%s","max_tokens":1,"messages":[{"role":"user","content":"ping"}],"stream":false}\n' "$(json_escape "$model")" > "$request"
-			if [ "$api_key_field" = "ANTHROPIC_API_KEY" ]; then
-				curl -sS --connect-timeout 15 --max-time "$timeout" -D "$headers" -o "$body" \
-					-H "Content-Type: application/json" \
-					-H "x-api-key: $api_key" \
-					-H "anthropic-version: 2023-06-01" \
-					--data-binary "@$request" "$url" >/dev/null 2>&1
-			else
-				curl -sS --connect-timeout 15 --max-time "$timeout" -D "$headers" -o "$body" \
-					-H "Content-Type: application/json" \
-					-H "Authorization: Bearer $api_key" \
-					-H "anthropic-version: 2023-06-01" \
-					--data-binary "@$request" "$url" >/dev/null 2>&1
-			fi
+			write_test_curl_config "$conf" "$url" "$timeout" "$headers" "$body" "$request" "claude" "$api_key" "$api_key_field" "2023-06-01" ""
+			curl -K "$conf" >/dev/null 2>&1
 			rc="$?"
 		;;
 		codex)
@@ -683,10 +764,8 @@ test_provider() {
 				printf '{"model":"%s","input":"ping","max_output_tokens":1,"stream":false}\n' "$(json_escape "$model")" > "$request"
 			fi
 			url="$(join_url "$base_url" "$path" "0")"
-			curl -sS --connect-timeout 15 --max-time "$timeout" -D "$headers" -o "$body" \
-				-H "Content-Type: application/json" \
-				-H "Authorization: Bearer $api_key" \
-				--data-binary "@$request" "$url" >/dev/null 2>&1
+			write_test_curl_config "$conf" "$url" "$timeout" "$headers" "$body" "$request" "codex" "$api_key" "" "" ""
+			curl -K "$conf" >/dev/null 2>&1
 			rc="$?"
 		;;
 	esac
@@ -711,7 +790,7 @@ test_provider() {
 		"$(json_escape "$url")" \
 		"$(json_file_excerpt "$body" 1200)"
 
-	rm -f "$headers" "$body" "$request"
+	rm -rf "$tmpdir"
 }
 
 list_backups_json() {
@@ -1074,7 +1153,7 @@ usage_trim() {
 	[ -n "$limit" ] || limit="$DEFAULT_USAGE_RETAIN"
 	[ "$limit" -gt 0 ] 2>/dev/null || limit="$DEFAULT_USAGE_RETAIN"
 	[ -f "$USAGE_LOG" ] || { json_ok "Usage log trimmed"; return 0; }
-	tmp="$USAGE_LOG.tmp.$$"
+	tmp="$(mktemp "$USAGE_LOG.tmp.XXXXXX" 2>/dev/null)" || tmp="$USAGE_LOG.tmp.$$"
 	tail -n "$limit" "$USAGE_LOG" > "$tmp" && mv "$tmp" "$USAGE_LOG"
 	chmod 600 "$USAGE_LOG" 2>/dev/null
 	json_ok "Usage log trimmed"

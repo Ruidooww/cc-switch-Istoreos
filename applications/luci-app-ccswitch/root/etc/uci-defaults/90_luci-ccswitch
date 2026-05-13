@@ -10,26 +10,38 @@ ccswitch_has_provider() {
 }
 
 ccswitch_add_claude_provider() {
-	local section
-	ccswitch_has_provider "$1" && return 0
+	local section name preset website base key_field model haiku sonnet opus notes
+	name="$1"
+	preset="$2"
+	website="$3"
+	base="$4"
+	key_field="$5"
+	model="$6"
+	haiku="$7"
+	sonnet="$8"
+	opus="$9"
+	shift 9
+	notes="$1"
+
+	ccswitch_has_provider "$name" && return 0
 	section="$(uci -q add ccswitch claude_provider)" || return 0
-	uci -q set ccswitch."$section".name="$1"
-	uci -q set ccswitch."$section".preset="$2"
+	uci -q set ccswitch."$section".name="$name"
+	uci -q set ccswitch."$section".preset="$preset"
 	uci -q set ccswitch."$section".enabled='0'
-	uci -q set ccswitch."$section".website_url="$3"
-	uci -q set ccswitch."$section".base_url="$4"
+	uci -q set ccswitch."$section".website_url="$website"
+	uci -q set ccswitch."$section".base_url="$base"
 	uci -q set ccswitch."$section".is_full_url='0'
 	uci -q set ccswitch."$section".api_key=''
 	uci -q set ccswitch."$section".api_key_ref=''
 	uci -q set ccswitch."$section".api_format='anthropic'
-	uci -q set ccswitch."$section".api_key_field="$5"
-	uci -q set ccswitch."$section".model="$6"
-	uci -q set ccswitch."$section".haiku_model="$7"
-	uci -q set ccswitch."$section".sonnet_model="$8"
-	uci -q set ccswitch."$section".opus_model="$9"
+	uci -q set ccswitch."$section".api_key_field="$key_field"
+	uci -q set ccswitch."$section".model="$model"
+	uci -q set ccswitch."$section".haiku_model="$haiku"
+	uci -q set ccswitch."$section".sonnet_model="$sonnet"
+	uci -q set ccswitch."$section".opus_model="$opus"
 	uci -q set ccswitch."$section".input_price_million='0'
 	uci -q set ccswitch."$section".output_price_million='0'
-	uci -q set ccswitch."$section".notes="${10}"
+	uci -q set ccswitch."$section".notes="$notes"
 }
 
 ccswitch_add_codex_provider() {

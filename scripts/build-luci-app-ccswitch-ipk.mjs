@@ -5,7 +5,7 @@ import { gzipSync } from 'node:zlib';
 const repoRoot = process.cwd();
 const packageRoot = join(repoRoot, 'applications', 'luci-app-ccswitch');
 const distDir = join(repoRoot, 'dist');
-const version = '1.5.2-1';
+const version = '1.5.5-1';
 const packageName = 'luci-app-ccswitch';
 const output = join(distDir, `${packageName}_${version}_all.ipk`);
 

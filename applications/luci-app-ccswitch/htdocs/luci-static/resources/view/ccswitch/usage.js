@@ -21,7 +21,7 @@ function downloadText(filename, content) {
 	window.setTimeout(function() {
 		URL.revokeObjectURL(url);
 		document.body.removeChild(a);
-	}, 0);
+	}, 60000);
 }
 
 function metricCard(title, value, hint) {

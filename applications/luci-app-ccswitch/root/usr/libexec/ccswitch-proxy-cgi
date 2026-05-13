@@ -6,7 +6,15 @@ DEFAULT_TIMEOUT="600"
 DEFAULT_RETAIN="2000"
 
 json_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+	printf '%s' "$1" | awk 'BEGIN { ORS = ""; first = 1 } {
+		gsub(/\\/,"\\\\")
+		gsub(/"/,"\\\"")
+		gsub(/\r/,"\\r")
+		gsub(/\t/,"\\t")
+		if (!first) printf "\\n"
+		printf "%s", $0
+		first = 0
+	}'
 }
 
 json_file_excerpt() {
@@ -17,6 +25,30 @@ json_file_excerpt() {
 
 json_bool() {
 	[ "$1" = "1" ] && printf 'true' || printf 'false'
+}
+
+make_tmp_dir() {
+	local prefix="$1" dir
+	[ -n "$prefix" ] || prefix="ccswitch"
+	dir="$(mktemp -d "/tmp/$prefix.XXXXXX" 2>/dev/null)" && {
+		printf '%s' "$dir"
+		return 0
+	}
+	dir="/tmp/$prefix.$$.$(date +%s)"
+	mkdir -p "$dir" 2>/dev/null && {
+		printf '%s' "$dir"
+		return 0
+	}
+	return 1
+}
+
+valid_section_name() {
+	case "$1" in
+		''|*[!A-Za-z0-9_]*)
+			return 1
+		;;
+	esac
+	return 0
 }
 
 header_status_text() {
@@ -124,8 +156,8 @@ replace_model() {
 	[ -n "$model" ] || return 0
 	[ -s "$file" ] || return 0
 	tmp="$file.model"
-	esc="$(printf '%s' "$model" | sed 's/[\/&]/\\&/g')"
-	sed -E "s/\"model\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"model\":\"$esc\"/" "$file" > "$tmp" && mv "$tmp" "$file"
+	esc="$(json_escape "$model" | sed 's/[\\\/&]/\\&/g')"
+	sed "s/\"model\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"model\":\"$esc\"/" "$file" > "$tmp" && mv "$tmp" "$file"
 }
 
 read_body() {
@@ -223,14 +255,17 @@ rotate_usage_log() {
 	[ -f "$LOG_FILE" ] || return 0
 	count="$(wc -l < "$LOG_FILE" 2>/dev/null | tr -d ' ')"
 	[ "$count" -gt "$retain" ] 2>/dev/null || return 0
-	tmp="$LOG_FILE.tmp.$$"
+	tmp="$(mktemp "$LOG_FILE.tmp.XXXXXX" 2>/dev/null)" || tmp="$LOG_FILE.tmp.$$"
 	tail -n "$retain" "$LOG_FILE" > "$tmp" && mv "$tmp" "$LOG_FILE"
 	chmod 600 "$LOG_FILE" 2>/dev/null
 }
 
 append_usage() {
-	local app="$1" path="$2" provider="$3" upstream="$4" status="$5" started="$6" req_file="$7" resp_file="$8" model="$9" section="${10}" curl_exit="${11:-0}"
+	local app="$1" path="$2" provider="$3" upstream="$4" status="$5" started="$6" req_file="$7" resp_file="$8" model="$9" section curl_exit
 	local ended duration req_bytes resp_bytes input output cache_read cache_create cache_openai cache total input_price output_price cost kind hint log_requests excerpt
+	shift 9
+	section="$1"
+	curl_exit="${2:-0}"
 
 	log_requests="$(uci_get proxy log_requests)"
 	[ "$log_requests" = "0" ] && return 0
@@ -294,12 +329,18 @@ append_usage() {
 }
 
 curl_config_escape() {
-	printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+	printf '%s' "$1" | awk 'BEGIN { ORS = "" } { gsub(/[[:cntrl:]]/,""); printf "%s", $0 }' | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 write_curl_config() {
-	local file="$1" method="$2" url="$3" req_file="$4" timeout="$5" content_type="$6" app="$7" api_key="$8" key_field="$9" beta="${10}" version="${11}"
+	local file="$1" method="$2" url="$3" req_file="$4" body_file="$5" header_file="$6" timeout="$7" content_type="$8" app="$9" api_key key_field beta version
+	shift 9
+	api_key="$1"
+	key_field="$2"
+	beta="$3"
+	version="$4"
 
+	umask 077
 	{
 		printf 'url = "%s"\n' "$(curl_config_escape "$url")"
 		printf 'request = "%s"\n' "$(curl_config_escape "$method")"
@@ -307,6 +348,8 @@ write_curl_config() {
 		printf 'max-time = %s\n' "$timeout"
 		printf 'silent\n'
 		printf 'show-error\n'
+		[ -n "$body_file" ] && printf 'output = "%s"\n' "$(curl_config_escape "$body_file")"
+		[ -n "$header_file" ] && printf 'dump-header = "%s"\n' "$(curl_config_escape "$header_file")"
 		printf 'header = "Content-Type: %s"\n' "$(curl_config_escape "$content_type")"
 		case "$app" in
 			claude)
@@ -326,6 +369,7 @@ write_curl_config() {
 			printf 'data-binary = "@%s"\n' "$(curl_config_escape "$req_file")"
 		fi
 	} > "$file"
+	chmod 600 "$file" 2>/dev/null
 }
 
 extract_status() {
@@ -346,16 +390,42 @@ wait_for_headers() {
 	return 1
 }
 
-proxy_with_curl_buffered() {
-	local method="$1" upstream="$2" req_file="$3" timeout="$4" content_type="$5" app="$6" api_key="$7" key_field="$8" beta="$9" version="${10}" started="${11}" provider="${12}" path="${13}" model="${14}" section="${15}"
-	local base conf headers body status ct
-	base="/tmp/ccswitch-proxy.$$"
-	conf="$base.curl"
-	headers="$base.headers"
-	body="$base.body"
+proxy_with_curl() {
+	local method="$1" upstream="$2" req_file="$3" timeout="$4" content_type="$5" app="$6" api_key="$7" key_field="$8" beta="$9" version stream started provider path model section
+	local tmpdir conf headers body status ct rc
+	shift 9
+	version="$1"
+	stream="$2"
+	started="$3"
+	provider="$4"
+	path="$5"
+	model="$6"
+	section="$7"
 
-	write_curl_config "$conf" "$method" "$upstream" "$req_file" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version"
-	if ! curl -K "$conf" -D "$headers" -o "$body" >/dev/null 2>&1; then
+	tmpdir="$(make_tmp_dir ccswitch-proxy)" || {
+		error_json 500 "failed to create temporary directory" "tmp_error"
+		return 0
+	}
+	conf="$tmpdir/curl.conf"
+	headers="$tmpdir/headers"
+	body="$tmpdir/body"
+
+	if [ "$stream" = "1" ]; then
+		write_curl_config "$conf" "$method" "$upstream" "$req_file" "" "" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version"
+		: > "$body"
+		printf 'Status: 200 OK\r\n'
+		printf 'Content-Type: text/event-stream\r\n'
+		printf 'Cache-Control: no-store\r\n'
+		printf '\r\n'
+		curl -N -K "$conf"
+		rc="$?"
+		append_usage "$app" "$path" "$provider" "$upstream" "200" "$started" "$req_file" "$body" "$model" "$section" "$rc"
+		rm -rf "$tmpdir"
+		return 0
+	fi
+
+	write_curl_config "$conf" "$method" "$upstream" "$req_file" "$body" "$headers" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version"
+	if ! curl -K "$conf" >/dev/null 2>&1; then
 		echo '{"error":"upstream request failed","type":"network_error"}' > "$body"
 		status=502
 		ct="application/json"
@@ -370,40 +440,11 @@ proxy_with_curl_buffered() {
 	printf 'Cache-Control: no-store\r\n'
 	printf '\r\n'
 	cat "$body"
-	rm -f "$conf" "$headers" "$body"
-}
-
-proxy_with_curl_stream() {
-	local method="$1" upstream="$2" req_file="$3" timeout="$4" content_type="$5" app="$6" api_key="$7" key_field="$8" beta="$9" version="${10}" started="${11}" provider="${12}" path="${13}" model="${14}" section="${15}"
-	local base conf body status rc
-	base="/tmp/ccswitch-proxy.$$"
-	conf="$base.curl"
-	body="$base.body"
-	: > "$body"
-
-	write_curl_config "$conf" "$method" "$upstream" "$req_file" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version"
-
-	# Keep streaming on the proven 1.3.x path: write directly to the CGI
-	# response. Capturing stream chunks through FIFO/tee caused false 502s on
-	# some uhttpd/Lucky combinations when curl closed the stream.
-	printf 'Status: 200 OK\r\n'
-	printf 'Content-Type: text/event-stream\r\n'
-	printf 'Cache-Control: no-store\r\n'
-	printf '\r\n'
-	curl -N -K "$conf"
-	rc="$?"
-
-	# The HTTP status has already been sent to the client. Treat stream close
-	# as successful for proxy accounting and keep the raw curl exit for
-	# diagnostics, otherwise normal Claude streams can be logged as false 502s.
-	status=200
-
-	append_usage "$app" "$path" "$provider" "$upstream" "$status" "$started" "$req_file" "$body" "$model" "$section" "$rc"
-	rm -f "$conf" "$body"
+	rm -rf "$tmpdir"
 }
 
 main() {
-	local started path app section type provider base_url api_key model key_field is_full_url timeout content_type req_file upstream method stream beta version
+	local started path app section type provider base_url api_key model key_field is_full_url timeout content_type req_dir req_file upstream method stream beta version
 
 	started="$(date +%s)"
 	path="${REQUEST_URI%%\?*}"
@@ -429,6 +470,10 @@ main() {
 	section="$(current_section "$app")"
 	[ -n "$section" ] || {
 		error_json 400 "no active provider configured" "provider_missing"
+		return 0
+	}
+	valid_section_name "$section" || {
+		error_json 400 "active provider has invalid section name" "provider_section_error"
 		return 0
 	}
 
@@ -468,24 +513,25 @@ main() {
 		return 0
 	}
 
-	req_file="/tmp/ccswitch-proxy.$$.request"
+	req_dir="$(make_tmp_dir ccswitch-proxy)" || {
+		error_json 500 "failed to create temporary directory" "tmp_error"
+		return 0
+	}
+	req_file="$req_dir/request.json"
 	read_body "$req_file" "${CONTENT_LENGTH:-0}"
 	replace_model "$req_file" "$model"
 	upstream="$(join_url "$base_url" "$path" "$is_full_url")"
 
-	if grep -q '"stream"[[:space:]]*:[[:space:]]*true' "$req_file" 2>/dev/null; then
+	stream="$(jsonfilter -i "$req_file" -e '@.stream' 2>/dev/null | head -n 1)"
+	if [ "$stream" = "true" ] || [ "$stream" = "1" ]; then
 		stream=1
 	else
 		stream=0
 	fi
 
-	if [ "$stream" = "1" ]; then
-		proxy_with_curl_stream "$method" "$upstream" "$req_file" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version" "$started" "$provider" "$path" "$model" "$section"
-	else
-		proxy_with_curl_buffered "$method" "$upstream" "$req_file" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version" "$started" "$provider" "$path" "$model" "$section"
-	fi
+	proxy_with_curl "$method" "$upstream" "$req_file" "$timeout" "$content_type" "$app" "$api_key" "$key_field" "$beta" "$version" "$stream" "$started" "$provider" "$path" "$model" "$section"
 
-	rm -f "$req_file" "$req_file.model"
+	rm -rf "$req_dir"
 }
 
 main
